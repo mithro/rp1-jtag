@@ -9,12 +9,12 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Check for PIOLib (optional -- only available on RPi 5)
-find_path(PIOLIB_INCLUDE_DIR NAMES pio_platform.h
-    PATHS /usr/local/include /usr/include
+# Headers install to /usr/include/piolib/ (PATH_SUFFIXES finds the subdir).
+# Library is libpio.so (not libpiolib).
+find_path(PIOLIB_INCLUDE_DIR NAMES hardware/pio.h
+    PATH_SUFFIXES piolib
 )
-find_library(PIOLIB_LIBRARY NAMES piolib
-    PATHS /usr/local/lib /usr/lib
-)
+find_library(PIOLIB_LIBRARY NAMES pio)
 
 if(PIOLIB_INCLUDE_DIR AND PIOLIB_LIBRARY)
     set(HAVE_PIOLIB TRUE)

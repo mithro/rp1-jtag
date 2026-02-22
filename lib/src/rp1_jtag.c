@@ -218,6 +218,7 @@ static rp1_jtag_t *init_common(pio_backend_t *backend,
         .sideset_base = pins ? pins->tck : -1,
         .out_base     = pins ? pins->tdi : -1,
         .in_base      = pins ? pins->tdo : -1,
+        .tms_base     = pins ? pins->tms : -1,
         .clk_div      = (float)RP1_PIO_CLK_HZ / (jtag->freq_hz * 5),
     };
 

@@ -29,6 +29,7 @@ typedef struct {
     int sideset_base;  /* SIDESET pin (TCK) */
     int out_base;      /* OUT pin (TDI) */
     int in_base;       /* IN pin (TDO) */
+    int tms_base;      /* TMS GPIO pin (host-controlled, not a PIO pin) */
     float clk_div;     /* Clock divider */
 } pio_sm_pins_t;
 
