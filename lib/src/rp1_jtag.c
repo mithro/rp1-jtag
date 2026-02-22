@@ -173,6 +173,17 @@ static int pio_shift_chunk(rp1_jtag_t *jtag,
         }
     }
 
+    /* Drain spurious words from RX FIFO.
+     * RP1 PIO (v1) fires autopush before `push` instructions. For transfers
+     * that are exact multiples of 32 bits, autopush sends the real data word,
+     * then the explicit `push` sends a zeroed ISR as a spurious extra word.
+     * We must discard these to prevent them accumulating across transfers. */
+    {
+        uint32_t discard;
+        while (be->ops->rx_fifo_has_data(be))
+            be->ops->sm_get(be, &discard);
+    }
+
     /* Unpack TDO words into output bit vector */
     if (tdo) {
         words_to_bits(tdo_words, num_data_words, tdo, start_bit, num_bits);
