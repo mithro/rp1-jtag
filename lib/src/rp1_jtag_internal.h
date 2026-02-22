@@ -38,6 +38,8 @@ struct rp1_jtag {
     rp1_jtag_mode_t mode;
     uint32_t freq_hz;
     int instr_per_bit;    /* PIO cycles per JTAG bit (5 counted, 2 fast) */
+    pio_program_id_t current_program;  /* Currently loaded PIO program */
+    bool dma_configured;  /* Whether DMA channels are set up */
     pio_backend_t *backend;
 };
 

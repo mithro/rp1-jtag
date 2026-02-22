@@ -205,6 +205,131 @@ static int pio_shift_chunk(rp1_jtag_t *jtag,
     return 0;
 }
 
+/* ---- Program switching ---- */
+
+/*
+ * Minimum bits to justify switching to the fast program.
+ * Must amortize program-switch overhead (~50us on RP1 PIOLib).
+ * 256 bits = 8 words = 1 PIO transfer's worth of data.
+ */
+#define FAST_PROGRAM_THRESHOLD  256
+
+/*
+ * Switch to a different PIO program and update the clock divider.
+ * Disables the SM before switching, does NOT re-enable (caller decides).
+ */
+static int switch_program(rp1_jtag_t *jtag, pio_program_id_t prog,
+                          int new_instr_per_bit)
+{
+    pio_backend_t *be = jtag->backend;
+    int rc;
+
+    if (jtag->current_program == prog)
+        return 0;
+
+    be->ops->sm_set_enabled(be, false);
+
+    rc = be->ops->load_program(be, prog);
+    if (rc < 0)
+        return RP1_JTAG_ERR_IO;
+
+    jtag->current_program = prog;
+    jtag->instr_per_bit = new_instr_per_bit;
+
+    /* Update divider for new program's instructions-per-bit */
+    float div = (float)RP1_PIO_CLK_HZ /
+                (jtag->freq_hz * jtag->instr_per_bit);
+    if (div < 1.0f)
+        div = 1.0f;
+    be->ops->set_clk_div(be, div);
+
+    return 0;
+}
+
+/* ---- Fast PIO shift (no count word, enable/disable per transfer) ---- */
+
+/*
+ * Shift data using jtag_shift_fast (2 instr/bit, no count word).
+ * Only handles exact multiples of 32 bits. The SM is enabled at
+ * the start and disabled at the end (with TCK forced low).
+ *
+ * The fast program wraps infinitely, so the host must:
+ * 1. Enable SM
+ * 2. Interleave sm_put/sm_get for all words
+ * 3. Disable SM (stops TCK toggling)
+ * 4. Force TCK low (SM may have stopped with TCK high)
+ * 5. Drain spurious RX words
+ */
+static int pio_shift_fast_chunk(rp1_jtag_t *jtag,
+                                const uint8_t *tdi, uint8_t *tdo,
+                                uint32_t start_bit, uint32_t num_bits)
+{
+    pio_backend_t *be = jtag->backend;
+    int rc;
+
+    /* num_bits must be a multiple of 32 */
+    int num_words = num_bits / BITS_PER_WORD;
+    uint32_t tdi_words[MAX_TRANSFER_WORDS];
+    bits_to_words(tdi, start_bit, num_bits, tdi_words);
+
+    uint32_t tdo_words[MAX_TRANSFER_WORDS];
+
+    /* Enable SM — fast program starts immediately, stalls on autopull */
+    be->ops->sm_set_enabled(be, true);
+
+    /* Word-by-word FIFO interleaving (same as counted, minus count word) */
+    int tx_idx = 0;
+    int rx_idx = 0;
+
+    while (rx_idx < num_words) {
+        while (tx_idx < num_words &&
+               be->ops->tx_fifo_has_space(be)) {
+            rc = be->ops->sm_put(be, tdi_words[tx_idx]);
+            if (rc < 0)
+                goto stop;
+            tx_idx++;
+        }
+
+        while (rx_idx < num_words &&
+               be->ops->rx_fifo_has_data(be)) {
+            rc = be->ops->sm_get(be, &tdo_words[rx_idx]);
+            if (rc < 0)
+                goto stop;
+            rx_idx++;
+        }
+
+        if (rx_idx < num_words && tx_idx >= num_words) {
+            rc = be->ops->sm_get(be, &tdo_words[rx_idx]);
+            if (rc < 0)
+                goto stop;
+            rx_idx++;
+        }
+    }
+    rc = 0;
+
+stop:
+    /* Stop sequence: disable SM, force TCK low, drain FIFO */
+    be->ops->sm_set_enabled(be, false);
+
+    if (jtag->mode == MODE_JTAG && jtag->pins.tck >= 0)
+        be->ops->gpio_set(be, jtag->pins.tck, false);
+
+    {
+        uint32_t discard;
+        while (be->ops->rx_fifo_has_data(be))
+            be->ops->sm_get(be, &discard);
+    }
+
+    if (rc < 0)
+        return RP1_JTAG_ERR_IO;
+
+    /* Unpack TDO (no partial-word fixup needed — all words are full 32-bit) */
+    if (tdo)
+        words_to_bits(tdo_words, num_words, tdo, start_bit, num_bits);
+
+    return 0;
+}
+
 /* ---- PIO shift for a single TMS run ---- */
 
 int pio_shift_run(rp1_jtag_t *jtag, bool tms_value,
@@ -224,25 +349,83 @@ int pio_shift_run(rp1_jtag_t *jtag, bool tms_value,
             return RP1_JTAG_ERR_IO;
     }
 
-    /*
-     * Split large runs into MAX_CHUNK_BITS-sized PIO transfers.
-     * Each chunk is a separate PIO transfer (count word + data words).
-     * TMS stays constant since it's set once per run via GPIO.
-     */
     uint32_t bit_offset = start_bit;
     uint32_t remaining = num_bits;
 
-    while (remaining > 0) {
-        uint32_t chunk_bits = remaining;
-        if (chunk_bits > MAX_CHUNK_BITS)
-            chunk_bits = MAX_CHUNK_BITS;
+    /*
+     * Fast path: use jtag_shift_fast for bulk data (≥256 bits, JTAG mode).
+     * The fast program is 2 instructions/bit (vs 5), but only handles
+     * exact multiples of 32 bits. Remainder goes through counted program.
+     *
+     * Not used in loopback mode (fast program uses real pins, loopback
+     * program uses internal y-register copy).
+     */
+    if (remaining >= FAST_PROGRAM_THRESHOLD && jtag->mode == MODE_JTAG) {
+        uint32_t fast_bits = (remaining / BITS_PER_WORD) * BITS_PER_WORD;
+        uint32_t remainder_bits = remaining - fast_bits;
 
-        rc = pio_shift_chunk(jtag, tdi, tdo, bit_offset, chunk_bits);
+        /* Switch to fast program (disables SM) */
+        rc = switch_program(jtag, PIO_PROG_JTAG_SHIFT_FAST,
+                            INSTR_PER_BIT_FAST);
         if (rc < 0)
             return rc;
 
-        bit_offset += chunk_bits;
-        remaining -= chunk_bits;
+        /* Process in MAX_CHUNK_BITS-sized pieces */
+        while (fast_bits > 0) {
+            uint32_t chunk_bits = fast_bits;
+            if (chunk_bits > MAX_CHUNK_BITS)
+                chunk_bits = MAX_CHUNK_BITS;
+
+            rc = pio_shift_fast_chunk(jtag, tdi, tdo,
+                                      bit_offset, chunk_bits);
+            if (rc < 0)
+                return rc;
+
+            bit_offset += chunk_bits;
+            fast_bits -= chunk_bits;
+        }
+
+        remaining = remainder_bits;
+
+        if (remaining > 0) {
+            /* Switch back to counted program for remainder */
+            rc = switch_program(jtag, PIO_PROG_JTAG_SHIFT,
+                                INSTR_PER_BIT_COUNTED);
+            if (rc < 0)
+                return rc;
+            jtag->backend->ops->sm_set_enabled(jtag->backend, true);
+        }
+    }
+
+    /*
+     * Counted path: use jtag_shift for remaining bits (or all bits
+     * if below threshold). Handles any bit count including partial words.
+     */
+    if (remaining > 0) {
+        /* Ensure counted program is loaded and SM is running */
+        if (jtag->current_program != PIO_PROG_JTAG_SHIFT &&
+            jtag->current_program != PIO_PROG_JTAG_LOOPBACK) {
+            pio_program_id_t counted_prog =
+                (jtag->mode == MODE_LOOPBACK) ? PIO_PROG_JTAG_LOOPBACK
+                                               : PIO_PROG_JTAG_SHIFT;
+            rc = switch_program(jtag, counted_prog, INSTR_PER_BIT_COUNTED);
+            if (rc < 0)
+                return rc;
+            jtag->backend->ops->sm_set_enabled(jtag->backend, true);
+        }
+
+        while (remaining > 0) {
+            uint32_t chunk_bits = remaining;
+            if (chunk_bits > MAX_CHUNK_BITS)
+                chunk_bits = MAX_CHUNK_BITS;
+
+            rc = pio_shift_chunk(jtag, tdi, tdo, bit_offset, chunk_bits);
+            if (rc < 0)
+                return rc;
+
+            bit_offset += chunk_bits;
+            remaining -= chunk_bits;
+        }
     }
 
     return 0;
@@ -265,6 +448,7 @@ static rp1_jtag_t *init_common(pio_backend_t *backend,
     jtag->mode = mode;
     jtag->freq_hz = DEFAULT_FREQ_HZ;
     jtag->instr_per_bit = INSTR_PER_BIT_COUNTED;
+    jtag->current_program = prog;
 
     if (pins)
         jtag->pins = *pins;
