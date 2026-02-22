@@ -551,13 +551,14 @@ cleanup:
 }
 
 /*
- * Test B6: Fast program + DMA.
- * Uses DMA for TX and RX with the fast program. Tests stop sequence.
+ * Test B6: Fast program + DMA (32-byte ping-pong).
+ * Uses DMA in FIFO-depth chunks since larger DMA deadlocks.
+ * Tests stop sequence after multi-chunk transfers.
  */
 static void test_b6_fast_dma(void)
 {
     PIO pio; int sm; uint offset;
-    printf("B6: Fast program + DMA...\n");
+    printf("B6: Fast program + 32-byte ping-pong DMA...\n");
 
     if (setup_pio(&pio, &sm, &offset, &jtag_shift_fast_program,
                   jtag_shift_fast_program_get_default_config, false) < 0) {
@@ -567,49 +568,64 @@ static void test_b6_fast_dma(void)
 
     pio_sm_set_clkdiv(pio, sm, 16.67f);
 
-    int num_words = 64;
-    int chunk = num_words * 4;
+    /* Total transfer: 256 bytes = 64 words, in 32-byte (8-word) chunks */
+    int total_words = 64;
+    int total_bytes = total_words * 4;
+    int chunk_bytes = 32;  /* FIFO depth = 8 words = 32 bytes */
+    int chunk_words = chunk_bytes / 4;
+    int num_chunks = total_words / chunk_words;
 
-    /* Configure DMA channels */
+    /* Configure DMA channels for 32-byte transfers */
     int rc;
-    rc = pio_sm_config_xfer(pio, sm, PIO_DIR_TO_SM, chunk, 1);
+    rc = pio_sm_config_xfer(pio, sm, PIO_DIR_TO_SM, chunk_bytes, 1);
     if (rc < 0)
         FAIL("config_xfer TX failed: rc=%d", rc);
-    rc = pio_sm_config_xfer(pio, sm, PIO_DIR_FROM_SM, chunk, 1);
+    rc = pio_sm_config_xfer(pio, sm, PIO_DIR_FROM_SM, chunk_bytes, 1);
     if (rc < 0)
         FAIL("config_xfer RX failed: rc=%d", rc);
 
-    uint32_t *tx_data = malloc(chunk);
-    uint32_t *rx_data = calloc(1, chunk);
+    uint32_t *tx_data = malloc(total_bytes);
+    uint32_t *rx_data = calloc(1, total_bytes);
     if (!tx_data || !rx_data) {
         free(tx_data);
         free(rx_data);
         FAIL("malloc failed");
     }
 
-    for (int i = 0; i < num_words; i++)
+    for (int i = 0; i < total_words; i++)
         tx_data[i] = 0xD4A00000 + i;
 
     /* Run 3 back-to-back transfers to test state cleanliness */
     for (int run = 0; run < 3; run++) {
-        memset(rx_data, 0, chunk);
+        memset(rx_data, 0, total_bytes);
 
         pio_sm_set_enabled(pio, sm, true);
 
-        /* No count word for fast program — just data */
-        rc = pio_sm_xfer_data(pio, sm, PIO_DIR_TO_SM, chunk, tx_data);
-        if (rc < 0) {
-            printf("  run %d: TX DMA failed: rc=%d\n", run, rc);
-            pio_sm_set_enabled(pio, sm, false);
-            continue;
+        struct timespec t_start, t_end;
+        clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+        /* Ping-pong: TX 32 bytes, RX 32 bytes, repeat */
+        int ok = 1;
+        for (int c = 0; c < num_chunks; c++) {
+            rc = pio_sm_xfer_data(pio, sm, PIO_DIR_TO_SM,
+                                  chunk_bytes, &tx_data[c * chunk_words]);
+            if (rc < 0) {
+                printf("  run %d chunk %d: TX DMA failed: rc=%d\n",
+                       run, c, rc);
+                ok = 0;
+                break;
+            }
+            rc = pio_sm_xfer_data(pio, sm, PIO_DIR_FROM_SM,
+                                  chunk_bytes, &rx_data[c * chunk_words]);
+            if (rc < 0) {
+                printf("  run %d chunk %d: RX DMA failed: rc=%d\n",
+                       run, c, rc);
+                ok = 0;
+                break;
+            }
         }
 
-        rc = pio_sm_xfer_data(pio, sm, PIO_DIR_FROM_SM, chunk, rx_data);
-        if (rc < 0) {
-            printf("  run %d: RX DMA failed: rc=%d\n", run, rc);
-            pio_sm_set_enabled(pio, sm, false);
-            continue;
-        }
+        clock_gettime(CLOCK_MONOTONIC, &t_end);
 
         /* Stop sequence */
         pio_sm_set_enabled(pio, sm, false);
@@ -623,13 +639,18 @@ static void test_b6_fast_dma(void)
             spurious++;
         }
 
-        printf("  run %d: TX+RX DMA OK, %d spurious words\n", run, spurious);
+        if (!ok) continue;
+
+        double ms = time_diff_ms(&t_start, &t_end);
+        double kbps = (total_bytes / 1024.0) / (ms / 1000.0);
+        printf("  run %d: %.1f ms, %.1f kB/s, %d spurious\n",
+               run, ms, kbps, spurious);
     }
 
     free(tx_data);
     free(rx_data);
 
-    PASS("fast program DMA (no hang, 3 runs)");
+    PASS("fast program ping-pong DMA (3 runs)");
 cleanup:
     teardown_pio(pio, sm, offset, &jtag_shift_fast_program);
 }
@@ -798,6 +819,16 @@ int main(void)
 {
     printf("DMA + Fast PIO Exploration (requires RPi 5)\n");
     printf("============================================\n\n");
+
+    /* Report FIFO depth */
+    if (pio_init() >= 0) {
+        PIO pio = pio_open(0);
+        if (!PIO_IS_ERR(pio)) {
+            printf("RP1 PIO FIFO depth: %d words (%d bytes)\n\n",
+                   pio_get_fifo_depth(pio), pio_get_fifo_depth(pio) * 4);
+            pio_close(pio);
+        }
+    }
 
     printf("--- Part A: DMA basics (loopback program) ---\n");
     test_a1_tx_dma_manual_rx();
