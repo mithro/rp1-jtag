@@ -249,13 +249,50 @@ static int switch_program(rp1_jtag_t *jtag, pio_program_id_t prog,
 /* ---- Fast PIO shift (no count word, enable/disable per transfer) ---- */
 
 /*
+ * DMA transfer chunk size: 8 words = 32 bytes (matches RP1 FIFO depth).
+ * Larger DMA transfers deadlock because the blocking TX DMA fills the
+ * TX FIFO but nobody drains the RX FIFO, stalling the SM.
+ */
+#define DMA_CHUNK_WORDS  8
+#define DMA_CHUNK_BYTES  (DMA_CHUNK_WORDS * 4)
+
+/*
+ * Ensure DMA channels are configured (once, lazily).
+ */
+static int ensure_dma_configured(rp1_jtag_t *jtag)
+{
+    pio_backend_t *be = jtag->backend;
+    int rc;
+
+    if (jtag->dma_configured)
+        return 0;
+
+    if (!be->ops->config_xfer)
+        return -1;
+
+    rc = be->ops->config_xfer(be, PIO_BE_DIR_TX, DMA_CHUNK_BYTES, 1);
+    if (rc < 0)
+        return rc;
+
+    rc = be->ops->config_xfer(be, PIO_BE_DIR_RX, DMA_CHUNK_BYTES, 1);
+    if (rc < 0)
+        return rc;
+
+    jtag->dma_configured = true;
+    return 0;
+}
+
+/*
  * Shift data using jtag_shift_fast (2 instr/bit, no count word).
  * Only handles exact multiples of 32 bits. The SM is enabled at
  * the start and disabled at the end (with TCK forced low).
  *
+ * Uses DMA in 32-byte ping-pong chunks when available, falling
+ * back to word-by-word FIFO interleaving otherwise.
+ *
  * The fast program wraps infinitely, so the host must:
  * 1. Enable SM
- * 2. Interleave sm_put/sm_get for all words
+ * 2. Transfer all data (DMA ping-pong or word-by-word)
  * 3. Disable SM (stops TCK toggling)
  * 4. Force TCK low (SM may have stopped with TCK high)
  * 5. Drain spurious RX words
@@ -277,32 +314,63 @@ static int pio_shift_fast_chunk(rp1_jtag_t *jtag,
     /* Enable SM — fast program starts immediately, stalls on autopull */
     be->ops->sm_set_enabled(be, true);
 
-    /* Word-by-word FIFO interleaving (same as counted, minus count word) */
-    int tx_idx = 0;
-    int rx_idx = 0;
+    /* Try DMA path first */
+    bool use_dma = (be->ops->xfer_data != NULL &&
+                    ensure_dma_configured(jtag) == 0);
 
-    while (rx_idx < num_words) {
-        while (tx_idx < num_words &&
-               be->ops->tx_fifo_has_space(be)) {
-            rc = be->ops->sm_put(be, tdi_words[tx_idx]);
+    if (use_dma) {
+        /*
+         * DMA ping-pong: TX 32 bytes, RX 32 bytes, repeat.
+         * Each DMA call transfers 8 words (FIFO depth). This reduces
+         * the ioctl count from 2N (word-by-word) to N/4 (DMA chunks).
+         */
+        int word_idx = 0;
+        while (word_idx < num_words) {
+            int chunk_words = num_words - word_idx;
+            if (chunk_words > DMA_CHUNK_WORDS)
+                chunk_words = DMA_CHUNK_WORDS;
+            int chunk_bytes = chunk_words * 4;
+
+            rc = be->ops->xfer_data(be, PIO_BE_DIR_TX,
+                                    chunk_bytes, &tdi_words[word_idx]);
             if (rc < 0)
                 goto stop;
-            tx_idx++;
+
+            rc = be->ops->xfer_data(be, PIO_BE_DIR_RX,
+                                    chunk_bytes, &tdo_words[word_idx]);
+            if (rc < 0)
+                goto stop;
+
+            word_idx += chunk_words;
         }
+    } else {
+        /* Fallback: word-by-word FIFO interleaving */
+        int tx_idx = 0;
+        int rx_idx = 0;
 
-        while (rx_idx < num_words &&
-               be->ops->rx_fifo_has_data(be)) {
-            rc = be->ops->sm_get(be, &tdo_words[rx_idx]);
-            if (rc < 0)
-                goto stop;
-            rx_idx++;
-        }
+        while (rx_idx < num_words) {
+            while (tx_idx < num_words &&
+                   be->ops->tx_fifo_has_space(be)) {
+                rc = be->ops->sm_put(be, tdi_words[tx_idx]);
+                if (rc < 0)
+                    goto stop;
+                tx_idx++;
+            }
 
-        if (rx_idx < num_words && tx_idx >= num_words) {
-            rc = be->ops->sm_get(be, &tdo_words[rx_idx]);
-            if (rc < 0)
-                goto stop;
-            rx_idx++;
+            while (rx_idx < num_words &&
+                   be->ops->rx_fifo_has_data(be)) {
+                rc = be->ops->sm_get(be, &tdo_words[rx_idx]);
+                if (rc < 0)
+                    goto stop;
+                rx_idx++;
+            }
+
+            if (rx_idx < num_words && tx_idx >= num_words) {
+                rc = be->ops->sm_get(be, &tdo_words[rx_idx]);
+                if (rc < 0)
+                    goto stop;
+                rx_idx++;
+            }
         }
     }
     rc = 0;
