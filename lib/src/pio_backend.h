@@ -95,7 +95,37 @@ typedef struct {
      */
     int (*load_program)(pio_backend_t *be, pio_program_id_t prog);
 
+    /*
+     * Configure a DMA channel for bulk transfers (optional).
+     * dir: PIO_BE_DIR_TX or PIO_BE_DIR_RX
+     * buf_size: DMA buffer size in bytes
+     * buf_count: number of DMA buffers
+     * Returns 0 on success, negative on failure.
+     * NULL means DMA not supported (fall back to word-by-word).
+     */
+    int (*config_xfer)(pio_backend_t *be, int dir,
+                       uint32_t buf_size, uint32_t buf_count);
+
+    /*
+     * Transfer data via DMA (blocking).
+     * dir: PIO_BE_DIR_TX or PIO_BE_DIR_RX
+     * data_bytes: transfer size in bytes (must be word-aligned)
+     * data: source buffer (TX) or destination buffer (RX)
+     * Returns 0 on success, negative on failure.
+     *
+     * RP1 hardware limit: max 32 bytes per call (FIFO depth).
+     * Larger transfers deadlock because the blocking TX DMA fills
+     * the TX FIFO but nobody drains the RX FIFO, stalling the SM.
+     * Callers must ping-pong TX/RX in FIFO-depth chunks.
+     */
+    int (*xfer_data)(pio_backend_t *be, int dir,
+                     uint32_t data_bytes, void *data);
+
 } pio_backend_ops_t;
+
+/* DMA transfer directions */
+#define PIO_BE_DIR_TX  0  /* Host -> PIO (TX FIFO) */
+#define PIO_BE_DIR_RX  1  /* PIO -> Host (RX FIFO) */
 
 struct pio_backend {
     const pio_backend_ops_t *ops;

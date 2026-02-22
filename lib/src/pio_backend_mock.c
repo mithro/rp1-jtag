@@ -124,6 +124,40 @@ static int mock_load_program(pio_backend_t *be, pio_program_id_t prog)
     return 0;
 }
 
+static int mock_config_xfer(pio_backend_t *be, int dir,
+                            uint32_t buf_size, uint32_t buf_count)
+{
+    (void)be; (void)dir; (void)buf_size; (void)buf_count;
+    return 0;
+}
+
+static int mock_xfer_data(pio_backend_t *be, int dir,
+                          uint32_t data_bytes, void *data)
+{
+    mock_backend_t *m = (mock_backend_t *)be;
+
+    uint32_t num_words = data_bytes / 4;
+    uint32_t *words = (uint32_t *)data;
+
+    if (dir == 0) {
+        /* TX: store data as if sm_put was called per word */
+        for (uint32_t i = 0; i < num_words && m->tx_count < MOCK_FIFO_SIZE; i++) {
+            m->tx_data[m->tx_count++] = words[i];
+            m->put_count++;
+        }
+    } else {
+        /* RX: return pre-loaded TDO data as if sm_get was called per word */
+        for (uint32_t i = 0; i < num_words; i++) {
+            if (m->rx_read_pos < m->rx_count)
+                words[i] = m->rx_data[m->rx_read_pos++];
+            else
+                words[i] = 0;
+            m->get_count++;
+        }
+    }
+    return 0;
+}
+
 static const pio_backend_ops_t mock_ops = {
     .init             = mock_init,
     .close            = mock_close,
@@ -135,6 +169,8 @@ static const pio_backend_ops_t mock_ops = {
     .rx_fifo_has_data  = mock_rx_fifo_has_data,
     .sm_set_enabled   = mock_sm_set_enabled,
     .load_program     = mock_load_program,
+    .config_xfer      = mock_config_xfer,
+    .xfer_data        = mock_xfer_data,
 };
 
 pio_backend_t *pio_backend_mock_create(void)
