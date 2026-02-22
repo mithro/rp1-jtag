@@ -1,16 +1,13 @@
 
 # librp1jtag - Core C library
 
-# Sources that always build (no PIOLib dependency)
+# All sources always build. pio_backend_rp1.c has an #ifdef HAVE_PIOLIB
+# guard that provides a stub returning NULL when PIOLib is unavailable.
 set(LIB_SOURCES
     src/rp1_jtag.c
     src/pio_backend_mock.c
+    src/pio_backend_rp1.c
 )
-
-# Real backend only when PIOLib is available
-if(HAVE_PIOLIB)
-    list(APPEND LIB_SOURCES src/pio_backend_rp1.c)
-endif()
 
 add_library(rp1jtag ${LIB_SOURCES})
 
