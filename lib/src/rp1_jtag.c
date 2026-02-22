@@ -184,6 +184,19 @@ static int pio_shift_chunk(rp1_jtag_t *jtag,
             be->ops->sm_get(be, &discard);
     }
 
+    /* Fix partial-word alignment from PIO right-shift ISR.
+     *
+     * With in_shift_right=true, each `in pins, 1` shifts data into the
+     * ISR from the MSB end. After N shifts (N < 32), valid data sits in
+     * bits [(32-N)..31], not bits [0..(N-1)]. Full 32-bit words from
+     * autopush are correctly aligned, but the last partial word from
+     * the explicit `push` instruction needs right-shifting. */
+    {
+        uint32_t partial_bits = num_bits % BITS_PER_WORD;
+        if (partial_bits != 0)
+            tdo_words[num_data_words - 1] >>= (BITS_PER_WORD - partial_bits);
+    }
+
     /* Unpack TDO words into output bit vector */
     if (tdo) {
         words_to_bits(tdo_words, num_data_words, tdo, start_bit, num_bits);
