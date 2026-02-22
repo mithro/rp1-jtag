@@ -10,6 +10,7 @@
 #ifdef HAVE_PIOLIB
 
 #include "pio_backend.h"
+#include "rp1_jtag.h"   /* for RP1_JTAG_ERR_* error codes */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
