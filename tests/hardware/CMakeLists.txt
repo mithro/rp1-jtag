@@ -19,8 +19,12 @@ target_link_libraries(test_bitstream rp1jtag_static)
 add_executable(bench_throughput bench_throughput.c)
 target_link_libraries(bench_throughput rp1jtag_static)
 
+add_executable(test_dma_explore test_dma_explore.c)
+target_link_libraries(test_dma_explore rp1jtag_static)
+
 # Hardware tests are NOT added to CTest (they need real hardware).
 # Run them manually:
 #   sudo ./test_pio_loopback
 #   sudo ./test_gpio_loopback
 #   sudo ./test_idcode
+#   sudo ./test_dma_explore
