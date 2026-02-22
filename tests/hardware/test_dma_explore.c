@@ -494,10 +494,6 @@ static void test_b5_fast_word_by_word(void)
     uint32_t tx_data[16];
     uint32_t rx_data[16] = {0};
     for (int i = 0; i < num_words; i++)
-        tx_data[i] = 0xFAST0000 + i;  /* Note: 0xFAST... is not valid hex */
-
-    /* Fill with recognizable pattern instead */
-    for (int i = 0; i < num_words; i++)
         tx_data[i] = 0xFA500000 + i;
 
     pio_sm_set_enabled(pio, sm, true);
