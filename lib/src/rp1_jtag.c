@@ -114,31 +114,21 @@ void words_to_bits(const uint32_t *words, int num_words,
     }
 }
 
-/* ---- PIO shift for a single TMS run ---- */
+/* ---- PIO shift for a single chunk ---- */
 
-int pio_shift_run(rp1_jtag_t *jtag, bool tms_value,
-                  const uint8_t *tdi, uint8_t *tdo,
-                  uint32_t start_bit, uint32_t num_bits)
+/* Maximum bits per PIO transfer chunk */
+#define MAX_CHUNK_BITS (MAX_TRANSFER_WORDS * BITS_PER_WORD)
+
+static int pio_shift_chunk(rp1_jtag_t *jtag,
+                           const uint8_t *tdi, uint8_t *tdo,
+                           uint32_t start_bit, uint32_t num_bits)
 {
     pio_backend_t *be = jtag->backend;
     int rc;
 
-    if (num_bits == 0)
-        return 0;
-
-    /* Set TMS via GPIO (only in JTAG mode, not loopback) */
-    if (jtag->mode == MODE_JTAG && jtag->pins.tms >= 0) {
-        rc = be->ops->gpio_set(be, jtag->pins.tms, tms_value);
-        if (rc < 0)
-            return RP1_JTAG_ERR_IO;
-    }
-
     /* Pack TDI bits into words */
     int num_data_words = (num_bits + BITS_PER_WORD - 1) / BITS_PER_WORD;
     uint32_t tdi_words[MAX_TRANSFER_WORDS];
-    if (num_data_words > MAX_TRANSFER_WORDS)
-        return RP1_JTAG_ERR_PARAM;
-
     bits_to_words(tdi, start_bit, num_bits, tdi_words);
 
     /* Write count word to TX FIFO */
@@ -186,6 +176,49 @@ int pio_shift_run(rp1_jtag_t *jtag, bool tms_value,
     /* Unpack TDO words into output bit vector */
     if (tdo) {
         words_to_bits(tdo_words, num_data_words, tdo, start_bit, num_bits);
+    }
+
+    return 0;
+}
+
+/* ---- PIO shift for a single TMS run ---- */
+
+int pio_shift_run(rp1_jtag_t *jtag, bool tms_value,
+                  const uint8_t *tdi, uint8_t *tdo,
+                  uint32_t start_bit, uint32_t num_bits)
+{
+    int rc;
+
+    if (num_bits == 0)
+        return 0;
+
+    /* Set TMS via GPIO (only in JTAG mode, not loopback) */
+    if (jtag->mode == MODE_JTAG && jtag->pins.tms >= 0) {
+        rc = jtag->backend->ops->gpio_set(jtag->backend,
+                                           jtag->pins.tms, tms_value);
+        if (rc < 0)
+            return RP1_JTAG_ERR_IO;
+    }
+
+    /*
+     * Split large runs into MAX_CHUNK_BITS-sized PIO transfers.
+     * Each chunk is a separate PIO transfer (count word + data words).
+     * TMS stays constant since it's set once per run via GPIO.
+     */
+    uint32_t bit_offset = start_bit;
+    uint32_t remaining = num_bits;
+
+    while (remaining > 0) {
+        uint32_t chunk_bits = remaining;
+        if (chunk_bits > MAX_CHUNK_BITS)
+            chunk_bits = MAX_CHUNK_BITS;
+
+        rc = pio_shift_chunk(jtag, tdi, tdo, bit_offset, chunk_bits);
+        if (rc < 0)
+            return rc;
+
+        bit_offset += chunk_bits;
+        remaining -= chunk_bits;
     }
 
     return 0;
