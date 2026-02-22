@@ -64,8 +64,8 @@ static pio_sim_t *create_jtag_sim(void)
     pio_sim_set_sideset(sim, 1, false, TCK_PIN);
     pio_sim_set_out_pins(sim, TDI_PIN, 1);
     pio_sim_set_in_pins(sim, TDO_PIN);
-    pio_sim_set_out_shift(sim, true, true, 32);    /* LSB-first, autopull at 32 (needed: out x,32 depletes OSR) */
-    pio_sim_set_in_shift(sim, true, false, 32);     /* LSB-first, no autopush (explicit push flushes) */
+    pio_sim_set_out_shift(sim, true, true, 32);    /* LSB-first, autopull at 32 */
+    pio_sim_set_in_shift(sim, true, true, 32);      /* LSB-first, autopush at 32 */
     pio_sim_set_wrap(sim, 0, 7);
 
     return sim;

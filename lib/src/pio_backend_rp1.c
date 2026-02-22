@@ -162,13 +162,20 @@ static int rp1_init(pio_backend_t *be, pio_program_id_t prog,
             sm_config_set_clkdiv(&c, pins->clk_div);
 
         /*
-         * Shift config: LSB-first (JTAG spec), autopull at 32.
-         * The jtag_shift program uses explicit pull for the count word,
-         * then autopull kicks in for subsequent TDI data words after
-         * out x,32 depletes the OSR.
+         * Shift config: LSB-first (JTAG spec), autopull/autopush at 32.
+         *
+         * Autopull: The jtag_shift program uses explicit pull for the
+         * count word, then autopull kicks in for subsequent TDI data
+         * words after out x,32 depletes the OSR.
+         *
+         * Autopush: Every 32 `in` instructions, the ISR is automatically
+         * pushed to RX FIFO and reset. Without autopush, transfers >32
+         * bits would lose data (ISR overflows) and deadlock (host waits
+         * for RX words that never arrive). The explicit `push` at the
+         * end of jtag_shift/jtag_loopback flushes the final partial word.
          */
         sm_config_set_out_shift(&c, true, true, 32);  /* LSB-first, autopull */
-        sm_config_set_in_shift(&c, true, false, 32);   /* LSB-first, no autopush */
+        sm_config_set_in_shift(&c, true, true, 32);   /* LSB-first, autopush */
 
         /* Initialize SM with config, starting at program offset */
         pio_sm_init(r->pio, r->sm, r->offset, &c);
