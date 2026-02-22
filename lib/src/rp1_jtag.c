@@ -264,6 +264,7 @@ static rp1_jtag_t *init_common(pio_backend_t *backend,
     jtag->backend = backend;
     jtag->mode = mode;
     jtag->freq_hz = DEFAULT_FREQ_HZ;
+    jtag->instr_per_bit = INSTR_PER_BIT_COUNTED;
 
     if (pins)
         jtag->pins = *pins;
@@ -276,7 +277,8 @@ static rp1_jtag_t *init_common(pio_backend_t *backend,
         .out_base     = pins ? pins->tdi : -1,
         .in_base      = pins ? pins->tdo : -1,
         .tms_base     = pins ? pins->tms : -1,
-        .clk_div      = (float)RP1_PIO_CLK_HZ / (jtag->freq_hz * 5),
+        .clk_div      = (float)RP1_PIO_CLK_HZ /
+                         (jtag->freq_hz * jtag->instr_per_bit),
     };
 
     int rc = backend->ops->init(backend, prog, &sm_pins);
@@ -333,9 +335,11 @@ int rp1_jtag_set_freq(rp1_jtag_t *jtag, uint32_t freq_hz)
     if (!jtag || freq_hz == 0)
         return RP1_JTAG_ERR_PARAM;
 
-    /* Clock divider: PIO runs 5 instructions per bit (jtag_shift),
-     * so TCK frequency = PIO_CLK / (5 * divider) */
-    float div = (float)RP1_PIO_CLK_HZ / (freq_hz * 5);
+    /*
+     * Clock divider: TCK freq = PIO_CLK / (instr_per_bit * divider).
+     * jtag_shift uses 5 instr/bit, jtag_shift_fast uses 2 instr/bit.
+     */
+    float div = (float)RP1_PIO_CLK_HZ / (freq_hz * jtag->instr_per_bit);
     if (div < 1.0f)
         div = 1.0f;
 

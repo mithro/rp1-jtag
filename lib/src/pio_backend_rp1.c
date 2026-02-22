@@ -41,6 +41,7 @@ typedef struct {
     bool initialized;
     pio_program_id_t current_program;
     const pio_program_t *current_pio_prog;
+    pio_sm_pins_t pins;  /* Saved for re-init after program switch */
 } rp1_backend_t;
 
 /* Map program ID to pioasm-generated pio_program_t struct */
@@ -116,6 +117,10 @@ static int rp1_init(pio_backend_t *be, pio_program_id_t prog,
     r->current_program = prog;
     r->current_pio_prog = pio_prog;
     r->initialized = true;
+
+    /* Save pin config for re-init after program switch */
+    if (pins)
+        r->pins = *pins;
 
     /* Configure SM */
     if (pins) {
@@ -269,6 +274,30 @@ static int rp1_load_program(pio_backend_t *be, pio_program_id_t prog)
 
     r->current_program = prog;
     r->current_pio_prog = pio_prog;
+
+    /*
+     * Re-init SM with new program's config (wrap, sideset, PC).
+     * Without this, the SM's wrap_top/wrap_bottom still point to
+     * the old program's locations — the .wrap won't work correctly.
+     */
+    pio_select(r->pio);
+    pio_sm_config c = get_program_config(prog, r->offset);
+
+    /* Re-apply pin configuration from saved init state */
+    if (r->pins.sideset_base >= 0)
+        sm_config_set_sideset_pins(&c, r->pins.sideset_base);
+    if (r->pins.out_base >= 0)
+        sm_config_set_out_pins(&c, r->pins.out_base, 1);
+    if (r->pins.in_base >= 0)
+        sm_config_set_in_pins(&c, r->pins.in_base);
+    if (r->pins.clk_div > 0)
+        sm_config_set_clkdiv(&c, r->pins.clk_div);
+
+    sm_config_set_out_shift(&c, true, true, 32);  /* LSB-first, autopull */
+    sm_config_set_in_shift(&c, true, true, 32);   /* LSB-first, autopush */
+
+    pio_sm_init(r->pio, r->sm, r->offset, &c);
+
     return 0;
 }
 

@@ -28,11 +28,16 @@ typedef enum {
     MODE_LOOPBACK,  /* Internal PIO loopback (no GPIO) */
 } rp1_jtag_mode_t;
 
+/* Instructions per bit for each PIO program */
+#define INSTR_PER_BIT_COUNTED  5  /* jtag_shift / jtag_loopback */
+#define INSTR_PER_BIT_FAST     2  /* jtag_shift_fast */
+
 /* Main library context */
 struct rp1_jtag {
     rp1_jtag_pins_t pins;
     rp1_jtag_mode_t mode;
     uint32_t freq_hz;
+    int instr_per_bit;    /* PIO cycles per JTAG bit (5 counted, 2 fast) */
     pio_backend_t *backend;
 };
 
