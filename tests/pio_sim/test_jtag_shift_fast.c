@@ -129,8 +129,9 @@ static void test_instruction_count(void)
         ASSERT(pio_sim_step(sim), "IN should succeed");
     }
 
-    /* After 64 instructions, should have shifted exactly 32 bits */
-    ASSERT_EQ(sim->osr_shift_count, 0, "OSR should be refilled by autopull");
+    /* After 64 instructions (32 OUTs + 32 INs), OSR is depleted.
+     * Autopull only fires *before* the next OUT, so shift_count = 32 here. */
+    ASSERT_EQ(sim->osr_shift_count, 32, "OSR should be depleted after 32 bits");
 
     pio_sim_destroy(sim);
     PASS();

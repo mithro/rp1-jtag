@@ -297,7 +297,7 @@ static void test_out_pins(void)
     TEST_ASSERT(sim != NULL, "create failed");
     pio_sim_set_sideset(sim, 1, false, 4);   /* TCK on GPIO 4 */
     pio_sim_set_out_pins(sim, 27, 1);        /* TDI on GPIO 27 */
-    pio_sim_set_out_shift(sim, true, false, 32);
+    pio_sim_set_out_shift(sim, true, true, 32);  /* autopull: out x,32 depletes OSR, autopull loads TDI word */
 
     /* Push count=0 (not used here) and data=0b10101 */
     pio_sim_tx_push(sim, 0);          /* count */
@@ -347,7 +347,7 @@ static void test_mov_y_to_x(void)
     /* SET Y, 7 then MOV X, Y */
     uint16_t prog[] = {
         0xe047, /* set y, 7 */
-        0xa021, /* mov x, y  (dest=001(x), op=00(none), src=010(y)) */
+        0xa022, /* mov x, y  (dest=001(x), op=00(none), src=010(y)) */
     };
 
     pio_sim_t *sim = pio_sim_create(prog, 2);

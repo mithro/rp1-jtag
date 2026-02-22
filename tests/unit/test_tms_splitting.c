@@ -72,7 +72,7 @@ static void test_alternating(void)
     for (int i = 0; i < 8; i++) {
         ASSERT_EQ(runs[i].start_bit, i, "start_bit");
         ASSERT_EQ(runs[i].num_bits, 1, "num_bits should be 1");
-        ASSERT_EQ(runs[i].tms_value, (i % 2) != 0, "tms_value alternates");
+        ASSERT_EQ(runs[i].tms_value, (i % 2) == 0, "tms_value alternates (0x55 LSB-first starts with 1)");
     }
     PASS();
 }

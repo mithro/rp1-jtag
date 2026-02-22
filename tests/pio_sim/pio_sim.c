@@ -626,6 +626,12 @@ void pio_sim_set_out_shift(pio_sim_t *sim, bool shift_right,
     sim->out_shift_right = shift_right;
     sim->autopull = autopull;
     sim->autopull_threshold = (threshold == 0) ? 32 : threshold;
+
+    /* On real PIO hardware, the OSR starts "empty" (shift count at threshold).
+     * This ensures the first OUT with autopull triggers an immediate pull
+     * from the TX FIFO, matching RP2040/RP1 behavior. */
+    if (autopull)
+        sim->osr_shift_count = sim->autopull_threshold;
 }
 
 void pio_sim_set_in_shift(pio_sim_t *sim, bool shift_right,
