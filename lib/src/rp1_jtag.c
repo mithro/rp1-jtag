@@ -252,9 +252,16 @@ static int switch_program(rp1_jtag_t *jtag, pio_program_id_t prog,
 /* ---- Fast PIO shift (no count word, SM managed by caller) ---- */
 
 /*
- * DMA transfer chunk size: 8 words = 32 bytes (matches RP1 FIFO depth).
- * Larger DMA transfers deadlock because the blocking TX DMA fills the
- * TX FIFO but nobody drains the RX FIFO, stalling the SM.
+ * DMA buffer size for config_xfer: must be large enough for the largest
+ * single xfer_data_bidi call. MAX_TRANSFER_WORDS * 4 = 32768 bytes.
+ */
+#define DMA_BUF_SIZE  (MAX_TRANSFER_WORDS * 4)
+
+/*
+ * DMA ping-pong chunk size: 8 words = 32 bytes (matches RP1 FIFO depth).
+ * Used only in the single-direction fallback path where larger transfers
+ * deadlock because the blocking TX DMA fills the TX FIFO but nobody
+ * drains the RX FIFO, stalling the SM.
  */
 #define DMA_CHUNK_WORDS  8
 #define DMA_CHUNK_BYTES  (DMA_CHUNK_WORDS * 4)
@@ -273,11 +280,11 @@ static int ensure_dma_configured(rp1_jtag_t *jtag)
     if (!be->ops->config_xfer)
         return -1;
 
-    rc = be->ops->config_xfer(be, PIO_BE_DIR_TX, DMA_CHUNK_BYTES, 1);
+    rc = be->ops->config_xfer(be, PIO_BE_DIR_TX, DMA_BUF_SIZE, 1);
     if (rc < 0)
         return rc;
 
-    rc = be->ops->config_xfer(be, PIO_BE_DIR_RX, DMA_CHUNK_BYTES, 1);
+    rc = be->ops->config_xfer(be, PIO_BE_DIR_RX, DMA_BUF_SIZE, 1);
     if (rc < 0)
         return rc;
 
@@ -293,8 +300,10 @@ static int ensure_dma_configured(rp1_jtag_t *jtag)
  * the last call. Between calls, the SM stalls safely with TCK low
  * (the `out pins, 1 side 0` instruction stalls on autopull).
  *
- * Uses DMA in 32-byte ping-pong chunks when available, falling
- * back to word-by-word FIFO interleaving otherwise.
+ * Three-tier DMA strategy:
+ *  1. xfer_data_bidi: threaded concurrent TX+RX (entire chunk, ~2 ioctls)
+ *  2. xfer_data ping-pong: TX 32B → RX 32B → repeat (~N/4 ioctls)
+ *  3. word-by-word FIFO interleaving (no DMA)
  */
 static int pio_shift_fast_chunk(rp1_jtag_t *jtag,
                                 const uint8_t *tdi, uint8_t *tdo,
@@ -310,13 +319,16 @@ static int pio_shift_fast_chunk(rp1_jtag_t *jtag,
 
     uint32_t tdo_words[MAX_TRANSFER_WORDS];
 
-    /* Try DMA path first */
-    bool use_dma = (be->ops->xfer_data != NULL &&
-                    ensure_dma_configured(jtag) == 0);
-
-    if (use_dma) {
+    /* Try threaded bidi DMA first (entire chunk in one call) */
+    if (be->ops->xfer_data_bidi && ensure_dma_configured(jtag) == 0) {
+        int data_bytes = num_words * 4;
+        rc = be->ops->xfer_data_bidi(be, data_bytes, tdi_words,
+                                          data_bytes, tdo_words);
+        if (rc < 0)
+            return RP1_JTAG_ERR_IO;
+    } else if (be->ops->xfer_data && ensure_dma_configured(jtag) == 0) {
         /*
-         * DMA ping-pong: TX 32 bytes, RX 32 bytes, repeat.
+         * Fallback: DMA ping-pong (TX 32 bytes, RX 32 bytes, repeat).
          * Each DMA call transfers 8 words (FIFO depth). This reduces
          * the ioctl count from 2N (word-by-word) to N/4 (DMA chunks).
          */
