@@ -57,6 +57,10 @@ sudo ./build/tests/hardware/test_pio_loopback
 openFPGALoader -c rp1pio --detect
 openFPGALoader -c rp1pio bitstream.bit
 
+# Using XVC (Xilinx Virtual Cable) for Vivado
+sudo ./build/xvc/rp1-xvc --pins 27:22:4:17
+# Then in Vivado: Open Hardware Manager → Add Virtual Cable → localhost:2542
+
 # Using the library directly
 sudo ./build/examples/idcode_read --tck 4 --tms 17 --tdi 27 --tdo 22
 ```
