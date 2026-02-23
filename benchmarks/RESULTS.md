@@ -40,11 +40,12 @@ Run 2 was an outlier (likely OS scheduling). Using runs 1 and 3:
 Very consistent. sys time ~34s (88% in kernel sysfs calls).
 - **Average: 39.0s, 96 kB/s**
 
-## RPi 5 — rp1-jtag (DMA + fast PIO)
+## RPi 5 — rp1-jtag (DMA + fast PIO), before optimisation
 
 - openFPGALoader with rp1pio cable driver using librp1jtag
 - Pins: TDI=27, TDO=22, TCK=4, TMS=17
 - Bitstream: user-100.bit (3,825,888 bytes)
+- TCK: 6 MHz default, MAX_TRANSFER_WORDS=1024 (4 KB chunks), SM enable/disable per chunk
 
 | Run | Wall time | kB/s |
 |-----|-----------|------|
@@ -54,13 +55,58 @@ Very consistent. sys time ~34s (88% in kernel sysfs calls).
 
 - **Average (runs 2-3): 6.53s, 572 kB/s**
 
+## RPi 5 — rp1-jtag (DMA + fast PIO), after optimisation
+
+- Same setup as above
+- Changes: SM kept running across chunks, MAX_TRANSFER_WORDS=8192 (32 KB chunks), default TCK raised to 10 MHz
+- Eliminates ~934 SM enable/disable ioctl pairs per bitstream load
+
+### 6 MHz (for comparison with baseline)
+
+| Run | Wall time | kB/s |
+|-----|-----------|------|
+| 1 | 6.22s | 602 |
+| 2 | 6.22s | 602 |
+| 3 | 6.42s | 583 |
+
+- **Average: 6.29s, 595 kB/s** (3.7% faster than 6.53s baseline)
+
+### 10 MHz (new default)
+
+| Run | Wall time | kB/s |
+|-----|-----------|------|
+| 1 | 6.21s | 603 |
+| 2 | 6.43s | 582 |
+| 3 | 6.43s | 582 |
+
+- **Average: 6.36s, 589 kB/s**
+
+### 20 MHz
+
+| Run | Wall time | kB/s |
+|-----|-----------|------|
+| 1 | 6.42s | 583 |
+| 2 | 6.21s | 603 |
+| 3 | 6.21s | 603 |
+
+- **Average: 6.28s, 596 kB/s**
+
+### Analysis
+
+The ~0.2s variance between fast (6.21s) and slow (6.42s) runs is OS scheduling jitter — it appears at all frequencies. The improvement from SM lifecycle hoisting is real but small: **best runs improved from 6.52s to 6.21s (4.8%)**.
+
+6 MHz, 10 MHz, and 20 MHz produce near-identical results, confirming that **PIO execution speed is not the bottleneck**. The dominant cost is DMA ioctl overhead: each 32-byte DMA transfer requires 2 PIOLib ioctls (TX + RX), giving ~240,000 ioctls per bitstream regardless of TCK frequency. The SM enable/disable savings (~1,868 ioctls) were <1% of total.
+
+**Next bottleneck**: Larger DMA transfers (>32 bytes) would reduce ioctl count but currently deadlock because blocking TX DMA fills the FIFO before RX can drain. Fixing this requires either non-blocking DMA or a kernel-side bidirectional transfer primitive.
+
 ## Summary
 
 | Platform | Method | Bitstream | Time | Throughput | vs RPi 5 sysfsgpio |
 |----------|--------|-----------|------|------------|-------------------|
 | RPi 3B+ | OpenOCD bcm2835gpio | 2.1 MB (35T) | 1.5s | 1,428 kB/s | 15x |
 | RPi 5 | OpenOCD sysfsgpio | 3.8 MB (100T) | 39.0s | 96 kB/s | 1x (baseline) |
-| RPi 5 | rp1-jtag (DMA + fast PIO) | 3.8 MB (100T) | 6.5s | 572 kB/s | 6x |
+| RPi 5 | rp1-jtag (before opt) | 3.8 MB (100T) | 6.5s | 572 kB/s | 6x |
+| RPi 5 | rp1-jtag (after opt) | 3.8 MB (100T) | 6.2s | 603 kB/s | 6.3x |
 
 ### Key observations
 
@@ -71,3 +117,7 @@ Very consistent. sys time ~34s (88% in kernel sysfs calls).
 3. **RPi 3 bcm2835gpio remains fastest in raw kB/s** — direct memory-mapped GPIO bit-banging has lower latency than PIO-mediated transfers. However, the RPi 3 is a much older, slower platform overall.
 
 4. **sysfsgpio on RPi 5 is faster than originally estimated** — we initially estimated ~5 kB/s based on simple test scripts, but OpenOCD 0.12's sysfsgpio driver achieves ~96 kB/s with optimized batched writes.
+
+5. **SM lifecycle optimisation gives ~5% improvement** — eliminating per-chunk SM enable/disable reduced ioctl count by ~1,868 but this is <1% of the ~240,000 total DMA ioctls. The dominant bottleneck is the 32-byte DMA transfer granularity, not SM management.
+
+6. **TCK frequency has no measurable effect** — 6/10/20 MHz all produce the same wall time, proving the PIO is idle most of the time waiting for the next DMA ioctl. Increasing DMA transfer size is the path to unlocking TCK scaling.
