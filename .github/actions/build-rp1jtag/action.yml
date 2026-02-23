@@ -1,0 +1,25 @@
+name: 'Build and install librp1jtag'
+description: 'Builds librp1jtag from source and installs it system-wide'
+
+inputs:
+  install-prefix:
+    description: 'CMAKE_INSTALL_PREFIX for the install'
+    required: false
+    default: '/usr'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Build librp1jtag
+      shell: bash
+      run: |
+        cmake -B rp1jtag-build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=${{ inputs.install-prefix }}
+        cmake --build rp1jtag-build --parallel
+
+    - name: Install librp1jtag
+      shell: bash
+      run: |
+        cmake --install rp1jtag-build
+        ldconfig
