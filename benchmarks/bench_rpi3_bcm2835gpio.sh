@@ -13,7 +13,7 @@ sudo openocd -f "$SCRIPTS/idcode.cfg" 2>&1
 
 # Determine FPGA variant and select bitstream
 # XC7A100T IDCODE: 0x13631093, XC7A35T IDCODE: 0x0362d093
-BITFILE="$IMAGES/user-100.bit"
+BITFILE="$IMAGES/user-35.bit"
 echo ""
 echo "=== Loading bitstream: $BITFILE ==="
 ls -l "$BITFILE"

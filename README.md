@@ -13,11 +13,17 @@ The RPi 5's GPIO pins connect to the RP1 chip via PCIe, making traditional softw
 
 ## Performance
 
-| Method | Throughput | 3.6 MB bitstream |
-|--------|-----------|-----------------|
-| sysfsgpio | ~5 kB/s | ~10 minutes |
-| librp1jtag (word-by-word) | ~400 kB/s | ~9 seconds |
-| librp1jtag (DMA) | ~750 kB/s+ | ~5 seconds |
+Bitstream load benchmarks on Xilinx Artix-7 FPGAs:
+
+| Platform | Method | Bitstream | Time | Throughput | vs sysfsgpio |
+|----------|--------|-----------|------|------------|-------------|
+| RPi 3B+ | OpenOCD bcm2835gpio | 2.1 MB (XC7A35T) | 1.5s | 1,428 kB/s | — |
+| RPi 5 | OpenOCD sysfsgpio | 3.8 MB (XC7A100T) | 39s | 96 kB/s | 1x |
+| RPi 5 | rp1-jtag (DMA + fast PIO) | 3.8 MB (XC7A100T) | 6.5s | 572 kB/s | 6x |
+
+On RPi 1-4, the BCM GPIO registers are memory-mapped directly, giving fast bit-bang performance. On RPi 5, GPIO goes through RP1 via PCIe — sysfsgpio is ~15x slower than RPi 3's bcm2835gpio. The rp1-jtag PIO approach recovers most of that lost performance.
+
+See [`benchmarks/`](benchmarks/) for scripts and raw results.
 
 ## Quick Start
 
