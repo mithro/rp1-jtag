@@ -1,0 +1,64 @@
+name: Static binary (openFPGALoader + rp1-jtag)
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-static:
+    name: static arm64
+    runs-on: ubuntu-24.04-arm
+    container: alpine:latest
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apk add --no-cache \
+            build-base cmake git python3 pkgconf \
+            libftdi1-dev libftdi1-static \
+            libusb-dev libusb-static \
+            eudev-dev eudev-static \
+            zlib-dev zlib-static \
+            hidapi-dev hidapi-static \
+            linux-headers \
+            argp-standalone
+
+      - name: Checkout rp1-jtag
+        uses: actions/checkout@v4
+        with:
+          path: rp1-jtag
+
+      - name: Build and install librp1jtag (static)
+        working-directory: rp1-jtag
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build build --parallel
+          cmake --install build
+
+      - name: Clone openFPGALoader
+        run: git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git
+
+      - name: Patch openFPGALoader with rp1-jtag driver
+        run: python3 rp1-jtag/drivers/openfpgaloader/integrate.py openFPGALoader
+
+      - name: Build openFPGALoader (static)
+        run: |
+          cmake -B openFPGALoader/build -S openFPGALoader \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_RP1_PIO=ON \
+            -DBUILD_STATIC=ON
+          cmake --build openFPGALoader/build --parallel
+
+      - name: Verify static linking
+        run: |
+          file openFPGALoader/build/openFPGALoader
+          # Verify the binary is statically linked
+          file openFPGALoader/build/openFPGALoader | grep -q "statically linked"
+
+      - name: Upload static binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-openfpgaloader-arm64
+          path: openFPGALoader/build/openFPGALoader
