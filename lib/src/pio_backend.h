@@ -107,19 +107,37 @@ typedef struct {
                        uint32_t buf_size, uint32_t buf_count);
 
     /*
-     * Transfer data via DMA (blocking).
+     * Transfer data via DMA (blocking, single direction).
      * dir: PIO_BE_DIR_TX or PIO_BE_DIR_RX
      * data_bytes: transfer size in bytes (must be word-aligned)
      * data: source buffer (TX) or destination buffer (RX)
      * Returns 0 on success, negative on failure.
      *
-     * RP1 hardware limit: max 32 bytes per call (FIFO depth).
-     * Larger transfers deadlock because the blocking TX DMA fills
-     * the TX FIFO but nobody drains the RX FIFO, stalling the SM.
-     * Callers must ping-pong TX/RX in FIFO-depth chunks.
+     * Each call is a blocking ioctl for one direction only. For transfers
+     * larger than the FIFO depth (8 words / 32 bytes), callers must either
+     * ping-pong TX/RX in FIFO-depth chunks or use xfer_data_bidi for
+     * concurrent transfers. Single-direction calls >32 bytes will deadlock
+     * because the SM stalls when one FIFO fills and nobody drains the other.
      */
     int (*xfer_data)(pio_backend_t *be, int dir,
                      uint32_t data_bytes, void *data);
+
+    /*
+     * Bidirectional DMA transfer (blocking, concurrent TX and RX).
+     * Runs TX and RX transfers concurrently so neither FIFO direction
+     * blocks the other. Enables transfers much larger than FIFO depth.
+     *
+     * tx_bytes: TX transfer size in bytes (must be word-aligned)
+     * tx_data: source buffer for TX (read-only)
+     * rx_bytes: RX transfer size in bytes (must be word-aligned)
+     * rx_data: destination buffer for RX
+     * Returns 0 on success, negative on failure.
+     *
+     * NULL means not supported (fall back to ping-pong xfer_data).
+     */
+    int (*xfer_data_bidi)(pio_backend_t *be,
+                          uint32_t tx_bytes, const void *tx_data,
+                          uint32_t rx_bytes, void *rx_data);
 
 } pio_backend_ops_t;
 
