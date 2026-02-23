@@ -20,6 +20,7 @@
  * The PIOLib API mirrors the Pico SDK API, providing userspace access
  * to the RP1 PIO hardware via /dev/pio0.
  */
+#include <pthread.h>
 #include <hardware/pio.h>
 #include <piolib.h>  /* for pio_sm_config_xfer, pio_sm_xfer_data, pio_xfer_dir */
 
@@ -320,6 +321,58 @@ static int rp1_xfer_data(pio_backend_t *be, int dir,
     return pio_sm_xfer_data(r->pio, r->sm, piolib_dir, data_bytes, data);
 }
 
+/* Thread argument for RX DMA in xfer_data_bidi */
+typedef struct {
+    PIO pio;
+    int sm;
+    uint32_t data_bytes;
+    void *data;
+    int result;
+} rp1_rx_thread_arg_t;
+
+static void *rp1_rx_dma_thread(void *arg)
+{
+    rp1_rx_thread_arg_t *a = (rp1_rx_thread_arg_t *)arg;
+    a->result = pio_sm_xfer_data(a->pio, a->sm,
+                                  PIO_DIR_FROM_SM, a->data_bytes, a->data);
+    return NULL;
+}
+
+static int rp1_xfer_data_bidi(pio_backend_t *be,
+                               uint32_t tx_bytes, const void *tx_data,
+                               uint32_t rx_bytes, void *rx_data)
+{
+    rp1_backend_t *r = (rp1_backend_t *)be;
+
+    /* Start RX DMA in background thread */
+    rp1_rx_thread_arg_t rx_arg = {
+        .pio = r->pio,
+        .sm = r->sm,
+        .data_bytes = rx_bytes,
+        .data = rx_data,
+        .result = -1,
+    };
+
+    pthread_t rx_thread;
+    int err = pthread_create(&rx_thread, NULL, rp1_rx_dma_thread, &rx_arg);
+    if (err != 0)
+        return -1;
+
+    /* TX DMA in main thread */
+    int tx_rc = pio_sm_xfer_data(r->pio, r->sm,
+                                  PIO_DIR_TO_SM, tx_bytes,
+                                  (void *)tx_data);
+
+    /* Wait for RX to complete */
+    pthread_join(rx_thread, NULL);
+
+    if (tx_rc < 0)
+        return tx_rc;
+    if (rx_arg.result < 0)
+        return rx_arg.result;
+    return 0;
+}
+
 static const pio_backend_ops_t rp1_ops = {
     .init             = rp1_init,
     .close            = rp1_close,
@@ -333,6 +386,7 @@ static const pio_backend_ops_t rp1_ops = {
     .load_program     = rp1_load_program,
     .config_xfer      = rp1_config_xfer,
     .xfer_data        = rp1_xfer_data,
+    .xfer_data_bidi   = rp1_xfer_data_bidi,
 };
 
 pio_backend_t *pio_backend_rp1_create(void)
