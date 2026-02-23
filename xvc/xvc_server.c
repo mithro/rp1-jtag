@@ -12,9 +12,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
 
 #define DEFAULT_PORT 2542
 #define DEFAULT_FREQ 6000000
+#define XVC_MAX_VECTOR_BYTES 32768
+
+static volatile sig_atomic_t running = 1;
+
+static void signal_handler(int sig)
+{
+    (void)sig;
+    running = 0;
+}
 
 static void usage(const char *prog)
 {
@@ -85,6 +100,192 @@ static int parse_pins(const char *arg, rp1_jtag_pins_t *pins)
     return 0;
 }
 
+/*
+ * Read exactly n bytes from fd into buf.
+ * Returns 0 on success, -1 on error or disconnect.
+ */
+static int read_exact(int fd, void *buf, size_t n)
+{
+    uint8_t *p = buf;
+    size_t remaining = n;
+
+    while (remaining > 0) {
+        ssize_t rc = read(fd, p, remaining);
+        if (rc < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (rc == 0)
+            return -1;
+        p += rc;
+        remaining -= (size_t)rc;
+    }
+    return 0;
+}
+
+/*
+ * Write exactly n bytes from buf to fd.
+ * Returns 0 on success, -1 on error.
+ */
+static int write_exact(int fd, const void *buf, size_t n)
+{
+    const uint8_t *p = buf;
+    size_t remaining = n;
+
+    while (remaining > 0) {
+        ssize_t rc = write(fd, p, remaining);
+        if (rc < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        p += rc;
+        remaining -= (size_t)rc;
+    }
+    return 0;
+}
+
+static uint32_t read_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0]
+         | (uint32_t)p[1] << 8
+         | (uint32_t)p[2] << 16
+         | (uint32_t)p[3] << 24;
+}
+
+static void write_le32(uint8_t *p, uint32_t val)
+{
+    p[0] = (uint8_t)(val);
+    p[1] = (uint8_t)(val >> 8);
+    p[2] = (uint8_t)(val >> 16);
+    p[3] = (uint8_t)(val >> 24);
+}
+
+/* Static buffers for shift data (avoids per-command allocation) */
+static uint8_t tms_buf[XVC_MAX_VECTOR_BYTES];
+static uint8_t tdi_buf[XVC_MAX_VECTOR_BYTES];
+static uint8_t tdo_buf[XVC_MAX_VECTOR_BYTES];
+
+/*
+ * Handle a single XVC client connection.
+ * Loops reading XVC commands until the client disconnects or an error occurs.
+ */
+static void handle_client(int fd, rp1_jtag_t *jtag, int verbose)
+{
+    uint8_t cmd_buf[8];
+
+    while (running) {
+        /* Read first byte to distinguish command */
+        if (read_exact(fd, cmd_buf, 1) < 0)
+            break;
+
+        if (cmd_buf[0] == 'g') {
+            /* getinfo: (8 bytes total) */
+            if (read_exact(fd, cmd_buf + 1, 7) < 0)
+                break;
+            if (memcmp(cmd_buf, "getinfo:", 8) != 0) {
+                fprintf(stderr, "Error: malformed getinfo command\n");
+                break;
+            }
+
+            const char *info = "xvcServer_v1.0:32768\n";
+            if (verbose)
+                printf("  getinfo -> %.*s\n", (int)(strlen(info) - 1), info);
+            if (write_exact(fd, info, strlen(info)) < 0)
+                break;
+
+        } else if (cmd_buf[0] == 's') {
+            /* Could be "shift:" (6 bytes) or "settck:" (7 bytes) */
+            if (read_exact(fd, cmd_buf + 1, 1) < 0)
+                break;
+
+            if (cmd_buf[1] == 'h') {
+                /* shift: */
+                if (read_exact(fd, cmd_buf + 2, 4) < 0)
+                    break;
+                if (memcmp(cmd_buf, "shift:", 6) != 0) {
+                    fprintf(stderr, "Error: malformed shift command\n");
+                    break;
+                }
+
+                uint8_t len_buf[4];
+                if (read_exact(fd, len_buf, 4) < 0)
+                    break;
+                uint32_t num_bits = read_le32(len_buf);
+                uint32_t byte_count = (num_bits + 7) / 8;
+
+                if (byte_count > XVC_MAX_VECTOR_BYTES) {
+                    fprintf(stderr, "Error: shift %u bits (%u bytes) exceeds max %d\n",
+                            num_bits, byte_count, XVC_MAX_VECTOR_BYTES);
+                    break;
+                }
+
+                if (read_exact(fd, tms_buf, byte_count) < 0)
+                    break;
+                if (read_exact(fd, tdi_buf, byte_count) < 0)
+                    break;
+
+                memset(tdo_buf, 0, byte_count);
+
+                int rc = rp1_jtag_shift(jtag, num_bits, tms_buf, tdi_buf, tdo_buf);
+                if (rc < 0) {
+                    fprintf(stderr, "Error: rp1_jtag_shift failed: %d\n", rc);
+                    break;
+                }
+
+                if (verbose)
+                    printf("  shift %u bits\n", num_bits);
+
+                if (write_exact(fd, tdo_buf, byte_count) < 0)
+                    break;
+
+            } else if (cmd_buf[1] == 'e') {
+                /* settck: */
+                if (read_exact(fd, cmd_buf + 2, 5) < 0)
+                    break;
+                if (memcmp(cmd_buf, "settck:", 7) != 0) {
+                    fprintf(stderr, "Error: malformed settck command\n");
+                    break;
+                }
+
+                uint8_t period_buf[4];
+                if (read_exact(fd, period_buf, 4) < 0)
+                    break;
+                uint32_t period_ns = read_le32(period_buf);
+
+                uint32_t freq_hz = 0;
+                if (period_ns > 0)
+                    freq_hz = 1000000000 / period_ns;
+
+                rp1_jtag_set_freq(jtag, freq_hz);
+                uint32_t actual_freq = rp1_jtag_get_freq(jtag);
+                uint32_t actual_period_ns = 0;
+                if (actual_freq > 0)
+                    actual_period_ns = 1000000000 / actual_freq;
+
+                if (verbose)
+                    printf("  settck %u ns -> %u Hz (actual %u ns)\n",
+                           period_ns, actual_freq, actual_period_ns);
+
+                uint8_t resp[4];
+                write_le32(resp, actual_period_ns);
+                if (write_exact(fd, resp, 4) < 0)
+                    break;
+
+            } else {
+                fprintf(stderr, "Error: unknown command starting with 's%c'\n",
+                        cmd_buf[1]);
+                break;
+            }
+
+        } else {
+            fprintf(stderr, "Error: unknown command byte 0x%02x\n", cmd_buf[0]);
+            break;
+        }
+    }
+}
+
 int main(int argc, char *argv[])
 {
     const char *pins_arg = NULL;
@@ -150,8 +351,83 @@ int main(int argc, char *argv[])
     printf("  Freq: %d Hz\n", freq);
     printf("  Verbose: %s\n", verbose ? "yes" : "no");
 
-    /* TODO: start XVC server */
-    printf("\nTODO: start server\n");
+    /* Initialize JTAG */
+    rp1_jtag_t *jtag = rp1_jtag_init(&pins);
+    if (!jtag) {
+        fprintf(stderr, "Error: failed to initialize JTAG\n");
+        return 1;
+    }
 
+    rp1_jtag_set_freq(jtag, (uint32_t)freq);
+    printf("  Actual freq: %u Hz\n", rp1_jtag_get_freq(jtag));
+
+    /* Set up signal handling */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    /* Create TCP server socket */
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("socket");
+        rp1_jtag_close(jtag);
+        return 1;
+    }
+
+    int opt_val = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt_val, sizeof(opt_val));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)port);
+
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        close(server_fd);
+        rp1_jtag_close(jtag);
+        return 1;
+    }
+
+    if (listen(server_fd, 1) < 0) {
+        perror("listen");
+        close(server_fd);
+        rp1_jtag_close(jtag);
+        return 1;
+    }
+
+    printf("Listening on port %d\n", port);
+
+    /* Accept loop */
+    while (running) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr,
+                               &client_len);
+        if (client_fd < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("accept");
+            break;
+        }
+
+        if (verbose)
+            printf("Client connected: %s:%d\n",
+                   inet_ntoa(client_addr.sin_addr),
+                   ntohs(client_addr.sin_port));
+
+        handle_client(client_fd, jtag, verbose);
+        close(client_fd);
+
+        if (verbose)
+            printf("Client disconnected\n");
+    }
+
+    printf("Shutting down\n");
+    close(server_fd);
+    rp1_jtag_close(jtag);
     return 0;
 }
