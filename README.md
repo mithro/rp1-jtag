@@ -113,6 +113,10 @@ sudo openFPGALoader -c rp1pio bitstream.bit
 # With explicit pin configuration (format: --pins TDI:TDO:TCK:TMS)
 sudo openFPGALoader -c rp1pio --pins 27:22:4:17 --detect
 
+# Using XVC (Xilinx Virtual Cable) for Vivado
+sudo ./build/xvc/rp1-xvc --pins 27:22:4:17
+# Then in Vivado: Open Hardware Manager → Add Virtual Cable → localhost:2542
+
 # Using the library directly
 sudo ./build/examples/idcode_read --tck 4 --tms 17 --tdi 27 --tdo 22
 ```
