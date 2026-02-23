@@ -252,16 +252,13 @@ static int switch_program(rp1_jtag_t *jtag, pio_program_id_t prog,
 /* ---- Fast PIO shift (no count word, SM managed by caller) ---- */
 
 /*
- * DMA buffer size for config_xfer: must be large enough for the largest
- * single xfer_data_bidi call. MAX_TRANSFER_WORDS * 4 = 32768 bytes.
- */
-#define DMA_BUF_SIZE  (MAX_TRANSFER_WORDS * 4)
-
-/*
  * DMA ping-pong chunk size: 8 words = 32 bytes (matches RP1 FIFO depth).
- * Used only in the single-direction fallback path where larger transfers
- * deadlock because the blocking TX DMA fills the TX FIFO but nobody
- * drains the RX FIFO, stalling the SM.
+ * Larger DMA transfers deadlock because the blocking TX DMA fills the
+ * TX FIFO but nobody drains the RX FIFO, stalling the SM.
+ *
+ * Note: config_xfer buf_size must also be 32 bytes. Larger values
+ * (e.g. 32768) cause PIOLib DMA timeouts even though the actual
+ * xfer_data calls only transfer 32 bytes each.
  */
 #define DMA_CHUNK_WORDS  8
 #define DMA_CHUNK_BYTES  (DMA_CHUNK_WORDS * 4)
@@ -280,11 +277,11 @@ static int ensure_dma_configured(rp1_jtag_t *jtag)
     if (!be->ops->config_xfer)
         return -1;
 
-    rc = be->ops->config_xfer(be, PIO_BE_DIR_TX, DMA_BUF_SIZE, 1);
+    rc = be->ops->config_xfer(be, PIO_BE_DIR_TX, DMA_CHUNK_BYTES, 1);
     if (rc < 0)
         return rc;
 
-    rc = be->ops->config_xfer(be, PIO_BE_DIR_RX, DMA_BUF_SIZE, 1);
+    rc = be->ops->config_xfer(be, PIO_BE_DIR_RX, DMA_CHUNK_BYTES, 1);
     if (rc < 0)
         return rc;
 
