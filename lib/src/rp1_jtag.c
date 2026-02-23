@@ -15,8 +15,11 @@
  * In practice, openFPGALoader generates 2-3 runs per call. */
 #define MAX_TMS_RUNS 256
 
-/* Maximum words per PIO transfer (TX FIFO data words, excluding count) */
-#define MAX_TRANSFER_WORDS 1024
+/* Maximum words per PIO transfer (TX FIFO data words, excluding count).
+ * Each chunk uses two stack arrays of this size (tdi_words + tdo_words),
+ * so 8192 words = 32 KB per array = 64 KB total stack usage per chunk.
+ * RPi 5 default stack limit is 8 MB, so this is well within bounds. */
+#define MAX_TRANSFER_WORDS 8192
 
 /* ---- Bit vector utilities ---- */
 
