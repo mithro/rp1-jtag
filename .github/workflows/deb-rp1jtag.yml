@@ -1,0 +1,37 @@
+name: Debian packages (rp1-jtag)
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-deb:
+    name: deb (${{ matrix.distro }})
+    runs-on: ubuntu-24.04-arm
+    container: debian:${{ matrix.distro }}
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [bookworm, trixie]
+
+    steps:
+      - name: Install build tooling
+        run: |
+          apt-get update
+          apt-get install -y \
+            build-essential cmake debhelper devscripts fakeroot git
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Debian packages
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: List built packages
+        run: ls -lh ../*.deb
+
+      - name: Upload librp1jtag0 deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs-rp1jtag-${{ matrix.distro }}
+          path: ../*.deb
