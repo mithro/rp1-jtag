@@ -22,6 +22,7 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <pthread.h>
 
 /* PIO program headers */
 #include "pio/generated/jtag_loopback.pio.h"
@@ -468,6 +469,155 @@ cleanup:
     teardown_pio(pio, sm, offset, &jtag_loopback_program);
 }
 
+/*
+ * Test A5: Threaded bidirectional DMA.
+ * Uses jtag_shift_fast (production program) with external TDI→TDO loopback.
+ * RX DMA runs in a pthread while TX DMA runs in the main thread.
+ * This validates that concurrent DMA channels don't deadlock on RP1.
+ */
+
+typedef struct {
+    PIO pio;
+    int sm;
+    uint32_t data_bytes;
+    void *data;
+    int result;
+} rx_thread_arg_t;
+
+static void *rx_dma_thread(void *arg)
+{
+    rx_thread_arg_t *a = (rx_thread_arg_t *)arg;
+    a->result = pio_sm_xfer_data(a->pio, a->sm,
+                                  PIO_DIR_FROM_SM, a->data_bytes, a->data);
+    return NULL;
+}
+
+static void test_a5_threaded_bidi_dma(void)
+{
+    PIO pio; int sm; uint offset;
+    printf("A5: Threaded bidirectional DMA (jtag_shift_fast, TDI→TDO loopback)...\n");
+    printf("    NOTE: Requires external wire from TDI (GPIO %d) to TDO (GPIO %d)\n",
+           TDI_PIN, TDO_PIN);
+
+    if (setup_pio(&pio, &sm, &offset, &jtag_shift_fast_program,
+                  jtag_shift_fast_program_get_default_config, true) < 0) {
+        FAIL("setup failed");
+        return;
+    }
+
+    /* Fast program: 2 instr/bit → 10 MHz TCK: div = 200M / (10M × 2) = 10 */
+    pio_sm_set_clkdiv(pio, sm, 10.0f);
+
+    static const int test_sizes[] = {256, 4096, 32768};
+    static const int num_sizes = sizeof(test_sizes) / sizeof(test_sizes[0]);
+
+    /* Configure DMA channels with large buf_size for threaded transfers */
+    int rc;
+    rc = pio_sm_config_xfer(pio, sm, PIO_DIR_TO_SM, 32768, 1);
+    if (rc < 0)
+        FAIL("config_xfer TX failed: rc=%d", rc);
+    rc = pio_sm_config_xfer(pio, sm, PIO_DIR_FROM_SM, 32768, 1);
+    if (rc < 0)
+        FAIL("config_xfer RX failed: rc=%d", rc);
+
+    for (int s = 0; s < num_sizes; s++) {
+        int chunk = test_sizes[s];
+        int num_words = chunk / 4;
+
+        uint32_t *tx_data = malloc(chunk);
+        uint32_t *rx_data = calloc(1, chunk);
+        if (!tx_data || !rx_data) {
+            free(tx_data);
+            free(rx_data);
+            FAIL("malloc for %d bytes", chunk);
+        }
+
+        for (int i = 0; i < num_words; i++)
+            tx_data[i] = 0xA5A50000 | (s << 8) | (i & 0xFF);
+
+        pio_sm_set_enabled(pio, sm, true);
+
+        struct timespec t_start, t_end;
+        clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+        /* Start RX DMA in pthread (must be armed before TX fills RX FIFO) */
+        rx_thread_arg_t rx_arg = {
+            .pio = pio,
+            .sm = sm,
+            .data_bytes = chunk,
+            .data = rx_data,
+            .result = -999,
+        };
+        pthread_t rx_thread;
+        rc = pthread_create(&rx_thread, NULL, rx_dma_thread, &rx_arg);
+        if (rc != 0) {
+            free(tx_data);
+            free(rx_data);
+            pio_sm_set_enabled(pio, sm, false);
+            FAIL("pthread_create failed: %d", rc);
+        }
+
+        /* TX DMA in main thread */
+        rc = pio_sm_xfer_data(pio, sm, PIO_DIR_TO_SM, chunk, tx_data);
+
+        /* Wait for RX thread */
+        pthread_join(rx_thread, NULL);
+
+        clock_gettime(CLOCK_MONOTONIC, &t_end);
+
+        pio_sm_set_enabled(pio, sm, false);
+
+        /* Force TCK low */
+        uint32_t tck_mask = 1u << TCK_PIN;
+        pio_sm_set_pins_with_mask(pio, sm, 0, tck_mask);
+
+        /* Drain spurious */
+        while (!pio_sm_is_rx_fifo_empty(pio, sm))
+            (void)pio_sm_get_blocking(pio, sm);
+
+        if (rc < 0) {
+            printf("  %5d bytes: TX DMA failed: rc=%d\n", chunk, rc);
+            free(tx_data);
+            free(rx_data);
+            continue;
+        }
+        if (rx_arg.result < 0) {
+            printf("  %5d bytes: RX DMA failed: rc=%d\n", chunk, rx_arg.result);
+            free(tx_data);
+            free(rx_data);
+            continue;
+        }
+
+        /* Verify data */
+        int mismatches = 0;
+        int first_mismatch = -1;
+        for (int i = 0; i < num_words; i++) {
+            if (rx_data[i] != tx_data[i]) {
+                if (first_mismatch < 0)
+                    first_mismatch = i;
+                mismatches++;
+            }
+        }
+
+        double ms = time_diff_ms(&t_start, &t_end);
+        double kbps = (chunk / 1024.0) / (ms / 1000.0);
+        printf("  %5d bytes: %.1f ms, %7.1f kB/s, %d mismatches",
+               chunk, ms, kbps, mismatches);
+        if (first_mismatch >= 0)
+            printf(" (first at word %d: got 0x%08x, exp 0x%08x)",
+                   first_mismatch,
+                   rx_data[first_mismatch], tx_data[first_mismatch]);
+        printf("\n");
+
+        free(tx_data);
+        free(rx_data);
+    }
+
+    PASS("threaded bidi DMA");
+cleanup:
+    teardown_pio(pio, sm, offset, &jtag_shift_fast_program);
+}
+
 /* ---- Part B: Fast program stop condition ---- */
 
 /*
@@ -835,6 +985,7 @@ int main(void)
     test_a2_manual_tx_rx_dma();
     test_a3_pingpong_dma();
     test_a4_concurrent_dma();
+    test_a5_threaded_bidi_dma();
 
     printf("\n--- Part B: Fast program stop condition ---\n");
     test_b5_fast_word_by_word();
