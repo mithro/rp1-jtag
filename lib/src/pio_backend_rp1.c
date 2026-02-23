@@ -386,7 +386,7 @@ static const pio_backend_ops_t rp1_ops = {
     .load_program     = rp1_load_program,
     .config_xfer      = rp1_config_xfer,
     .xfer_data        = rp1_xfer_data,
-    .xfer_data_bidi   = rp1_xfer_data_bidi,
+    .xfer_data_bidi   = NULL,  /* TODO: kernel serializes ioctls, bidi deadlocks */
 };
 
 pio_backend_t *pio_backend_rp1_create(void)
