@@ -1,0 +1,25 @@
+Source: rp1-jtag
+Section: libs
+Priority: optional
+Maintainer: Tim Ansell <tim@mithis.com>
+Build-Depends: debhelper-compat (= 13), cmake (>= 3.16)
+Standards-Version: 4.6.2
+Homepage: https://github.com/mithro/rp1-jtag
+
+Package: librp1jtag0
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: RP1 PIO JTAG library for Raspberry Pi 5
+ High-speed JTAG via RP1 PIO. Provides the core C library
+ for autonomous JTAG shift operations using the RP1's PIO
+ block on Raspberry Pi 5.
+
+Package: librp1jtag-dev
+Architecture: any
+Section: libdevel
+Depends: librp1jtag0 (= ${binary:Version}), ${misc:Depends}
+Description: RP1 PIO JTAG library - development files
+ Development headers and static library for librp1jtag.
+ .
+ This package contains the header files and static library
+ needed to develop programs that use librp1jtag.
