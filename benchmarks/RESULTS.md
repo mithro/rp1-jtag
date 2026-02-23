@@ -99,6 +99,37 @@ The ~0.2s variance between fast (6.21s) and slow (6.42s) runs is OS scheduling j
 
 **Next bottleneck**: Larger DMA transfers (>32 bytes) would reduce ioctl count but currently deadlock because blocking TX DMA fills the FIFO before RX can drain. Fixing this requires either non-blocking DMA or a kernel-side bidirectional transfer primitive.
 
+## RPi 5 — Threaded bidirectional DMA attempt (BLOCKED)
+
+- Attempted: concurrent TX + RX DMA via pthreads to eliminate 32-byte ping-pong
+- Goal: transfer entire 32 KB chunks in a single bidi call (~2 ioctls instead of ~8,192)
+
+### Result: BLOCKED by PIOLib kernel driver
+
+Two kernel-level limitations prevent concurrent DMA:
+
+1. **Per-SM ioctl serialization**: PIOLib's `pio_sm_xfer_data()` holds a per-SM mutex in the kernel. When the RX thread enters the kernel first and blocks waiting for SM data, the TX thread can't acquire the mutex to start feeding the SM. Result: deadlock → DMA timeout after ~1s.
+
+2. **config_xfer buf_size > 32 bytes causes DMA timeout**: Even with single-direction ping-pong, calling `pio_sm_config_xfer(buf_size=32768)` causes subsequent `pio_sm_xfer_data(32 bytes)` transfers to fail with a DMA timeout, despite the buf_size being a maximum, not an exact match. This is likely a PIOLib DMA buffer allocation issue.
+
+### Performance with bidi disabled (code present but NULL in vtable)
+
+The bidi API (`xfer_data_bidi`) is implemented in the backend abstraction and works correctly in mock tests. On RP1, it's set to NULL, falling back to the existing 32-byte ping-pong DMA.
+
+| Frequency | Run 1 | Run 2 | Run 3 | Average | kB/s |
+|-----------|-------|-------|-------|---------|------|
+| 10 MHz | 6.55s | 6.42s | 6.42s | 6.46s | 580 |
+| 20 MHz | 6.43s | 6.42s | 6.22s | 6.36s | 589 |
+
+No regression from the added code. Performance matches the post-SM-optimisation baseline.
+
+### Path forward
+
+Eliminating the ioctl bottleneck requires kernel-level changes:
+- A kernel-level bidirectional DMA ioctl that sets up both TX and RX DMA channels atomically
+- Or using separate PIO file descriptors (separate mutexes) for TX and RX
+- Or patching PIOLib to use finer-grained locking (per-direction, not per-SM)
+
 ## Summary
 
 | Platform | Method | Bitstream | Time | Throughput | vs RPi 5 sysfsgpio |
@@ -107,6 +138,7 @@ The ~0.2s variance between fast (6.21s) and slow (6.42s) runs is OS scheduling j
 | RPi 5 | OpenOCD sysfsgpio | 3.8 MB (100T) | 39.0s | 96 kB/s | 1x (baseline) |
 | RPi 5 | rp1-jtag (before opt) | 3.8 MB (100T) | 6.5s | 572 kB/s | 6x |
 | RPi 5 | rp1-jtag (after opt) | 3.8 MB (100T) | 6.2s | 603 kB/s | 6.3x |
+| RPi 5 | rp1-jtag (bidi DMA) | 3.8 MB (100T) | — | BLOCKED | kernel mutex |
 
 ### Key observations
 
@@ -121,3 +153,5 @@ The ~0.2s variance between fast (6.21s) and slow (6.42s) runs is OS scheduling j
 5. **SM lifecycle optimisation gives ~5% improvement** — eliminating per-chunk SM enable/disable reduced ioctl count by ~1,868 but this is <1% of the ~240,000 total DMA ioctls. The dominant bottleneck is the 32-byte DMA transfer granularity, not SM management.
 
 6. **TCK frequency has no measurable effect** — 6/10/20 MHz all produce the same wall time, proving the PIO is idle most of the time waiting for the next DMA ioctl. Increasing DMA transfer size is the path to unlocking TCK scaling.
+
+7. **PIOLib kernel driver blocks concurrent DMA** — threaded bidirectional DMA deadlocks due to per-SM mutex in the ioctl path. Also, `config_xfer(buf_size > 32)` causes DMA timeouts. Overcoming the ioctl bottleneck requires kernel-level changes (bidi ioctl, separate fds, or finer-grained locking).
