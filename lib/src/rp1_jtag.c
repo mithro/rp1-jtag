@@ -246,7 +246,7 @@ static int switch_program(rp1_jtag_t *jtag, pio_program_id_t prog,
     return 0;
 }
 
-/* ---- Fast PIO shift (no count word, enable/disable per transfer) ---- */
+/* ---- Fast PIO shift (no count word, SM managed by caller) ---- */
 
 /*
  * DMA transfer chunk size: 8 words = 32 bytes (matches RP1 FIFO depth).
@@ -283,19 +283,15 @@ static int ensure_dma_configured(rp1_jtag_t *jtag)
 }
 
 /*
- * Shift data using jtag_shift_fast (2 instr/bit, no count word).
- * Only handles exact multiples of 32 bits. The SM is enabled at
- * the start and disabled at the end (with TCK forced low).
+ * Shift one chunk using jtag_shift_fast (2 instr/bit, no count word).
+ * Only handles exact multiples of 32 bits.
+ *
+ * Caller must enable the SM before the first call and disable it after
+ * the last call. Between calls, the SM stalls safely with TCK low
+ * (the `out pins, 1 side 0` instruction stalls on autopull).
  *
  * Uses DMA in 32-byte ping-pong chunks when available, falling
  * back to word-by-word FIFO interleaving otherwise.
- *
- * The fast program wraps infinitely, so the host must:
- * 1. Enable SM
- * 2. Transfer all data (DMA ping-pong or word-by-word)
- * 3. Disable SM (stops TCK toggling)
- * 4. Force TCK low (SM may have stopped with TCK high)
- * 5. Drain spurious RX words
  */
 static int pio_shift_fast_chunk(rp1_jtag_t *jtag,
                                 const uint8_t *tdi, uint8_t *tdo,
@@ -310,9 +306,6 @@ static int pio_shift_fast_chunk(rp1_jtag_t *jtag,
     bits_to_words(tdi, start_bit, num_bits, tdi_words);
 
     uint32_t tdo_words[MAX_TRANSFER_WORDS];
-
-    /* Enable SM — fast program starts immediately, stalls on autopull */
-    be->ops->sm_set_enabled(be, true);
 
     /* Try DMA path first */
     bool use_dma = (be->ops->xfer_data != NULL &&
@@ -334,12 +327,12 @@ static int pio_shift_fast_chunk(rp1_jtag_t *jtag,
             rc = be->ops->xfer_data(be, PIO_BE_DIR_TX,
                                     chunk_bytes, &tdi_words[word_idx]);
             if (rc < 0)
-                goto stop;
+                return RP1_JTAG_ERR_IO;
 
             rc = be->ops->xfer_data(be, PIO_BE_DIR_RX,
                                     chunk_bytes, &tdo_words[word_idx]);
             if (rc < 0)
-                goto stop;
+                return RP1_JTAG_ERR_IO;
 
             word_idx += chunk_words;
         }
@@ -353,7 +346,7 @@ static int pio_shift_fast_chunk(rp1_jtag_t *jtag,
                    be->ops->tx_fifo_has_space(be)) {
                 rc = be->ops->sm_put(be, tdi_words[tx_idx]);
                 if (rc < 0)
-                    goto stop;
+                    return RP1_JTAG_ERR_IO;
                 tx_idx++;
             }
 
@@ -361,35 +354,18 @@ static int pio_shift_fast_chunk(rp1_jtag_t *jtag,
                    be->ops->rx_fifo_has_data(be)) {
                 rc = be->ops->sm_get(be, &tdo_words[rx_idx]);
                 if (rc < 0)
-                    goto stop;
+                    return RP1_JTAG_ERR_IO;
                 rx_idx++;
             }
 
             if (rx_idx < num_words && tx_idx >= num_words) {
                 rc = be->ops->sm_get(be, &tdo_words[rx_idx]);
                 if (rc < 0)
-                    goto stop;
+                    return RP1_JTAG_ERR_IO;
                 rx_idx++;
             }
         }
     }
-    rc = 0;
-
-stop:
-    /* Stop sequence: disable SM, force TCK low, drain FIFO */
-    be->ops->sm_set_enabled(be, false);
-
-    if (jtag->mode == MODE_JTAG && jtag->pins.tck >= 0)
-        be->ops->gpio_set(be, jtag->pins.tck, false);
-
-    {
-        uint32_t discard;
-        while (be->ops->rx_fifo_has_data(be))
-            be->ops->sm_get(be, &discard);
-    }
-
-    if (rc < 0)
-        return RP1_JTAG_ERR_IO;
 
     /* Unpack TDO (no partial-word fixup needed — all words are full 32-bit) */
     if (tdo)
@@ -438,6 +414,10 @@ int pio_shift_run(rp1_jtag_t *jtag, bool tms_value,
         if (rc < 0)
             return rc;
 
+        /* Enable SM once — fast program stalls safely on autopull
+         * when TX FIFO empties, holding TCK low between chunks. */
+        jtag->backend->ops->sm_set_enabled(jtag->backend, true);
+
         /* Process in MAX_CHUNK_BITS-sized pieces */
         while (fast_bits > 0) {
             uint32_t chunk_bits = fast_bits;
@@ -447,11 +427,25 @@ int pio_shift_run(rp1_jtag_t *jtag, bool tms_value,
             rc = pio_shift_fast_chunk(jtag, tdi, tdo,
                                       bit_offset, chunk_bits);
             if (rc < 0)
-                return rc;
+                break;
 
             bit_offset += chunk_bits;
             fast_bits -= chunk_bits;
         }
+
+        /* Stop sequence (once): disable SM, force TCK low, drain FIFO */
+        {
+            pio_backend_t *be = jtag->backend;
+            be->ops->sm_set_enabled(be, false);
+            if (jtag->mode == MODE_JTAG && jtag->pins.tck >= 0)
+                be->ops->gpio_set(be, jtag->pins.tck, false);
+            uint32_t discard;
+            while (be->ops->rx_fifo_has_data(be))
+                be->ops->sm_get(be, &discard);
+        }
+
+        if (rc < 0)
+            return rc;
 
         remaining = remainder_bits;
 
