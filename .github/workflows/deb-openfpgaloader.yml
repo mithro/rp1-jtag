@@ -21,8 +21,7 @@ jobs:
           apt-get install -y \
             build-essential cmake git pkg-config python3 \
             libftdi1-dev libusb-1.0-0-dev zlib1g-dev \
-            libhidapi-dev libudev-dev \
-            fakeroot
+            libhidapi-dev libudev-dev
 
       - name: Checkout rp1-jtag
         uses: actions/checkout@v4
@@ -55,42 +54,34 @@ jobs:
 
       - name: Create .deb package
         run: |
-          # Determine version from openFPGALoader
-          OFL_VERSION=$(cmake --build openFPGALoader/build --target help 2>&1 | head -1 || echo "unknown")
           OFL_DATE=$(date -u +%Y%m%d)
           PKG_VERSION="0.0.1~git${OFL_DATE}"
           ARCH=$(dpkg --print-architecture)
 
-          # Create staging directory
           PKG_DIR="openfpgaloader-rp1pio_${PKG_VERSION}_${ARCH}"
           mkdir -p "${PKG_DIR}/DEBIAN"
           mkdir -p "${PKG_DIR}/usr/bin"
           mkdir -p "${PKG_DIR}/usr/share/doc/openfpgaloader-rp1pio"
 
-          # Install binary
           cp openFPGALoader/build/openFPGALoader "${PKG_DIR}/usr/bin/openFPGALoader"
 
-          # Create control file
-          cat > "${PKG_DIR}/DEBIAN/control" << CTRL
-          Package: openfpgaloader-rp1pio
-          Version: ${PKG_VERSION}
-          Architecture: ${ARCH}
-          Maintainer: Tim Ansell <tim@mithis.com>
-          Depends: librp1jtag0, libftdi1-2, libusb-1.0-0, zlib1g, libhidapi-hidraw0
-          Section: electronics
-          Priority: optional
-          Homepage: https://github.com/mithro/rp1-jtag
-          Description: openFPGALoader with RP1 PIO JTAG support
-           openFPGALoader built with the rp1pio cable driver for high-speed
-           JTAG via the Raspberry Pi 5 RP1 PIO block.
-          CTRL
-          # Remove leading whitespace from heredoc (DEBIAN/control must not be indented)
-          sed -i 's/^          //' "${PKG_DIR}/DEBIAN/control"
+          # Write control file without indentation issues
+          printf '%s\n' \
+            "Package: openfpgaloader-rp1pio" \
+            "Version: ${PKG_VERSION}" \
+            "Architecture: ${ARCH}" \
+            "Maintainer: Tim Ansell <tim@mithis.com>" \
+            "Depends: librp1jtag0 (>= 0.1.0), libftdi1-2, libusb-1.0-0, zlib1g, libhidapi-hidraw0, libudev1" \
+            "Section: electronics" \
+            "Priority: optional" \
+            "Homepage: https://github.com/mithro/rp1-jtag" \
+            "Description: openFPGALoader with RP1 PIO JTAG support" \
+            " openFPGALoader built with the rp1pio cable driver for high-speed" \
+            " JTAG via the Raspberry Pi 5 RP1 PIO block." \
+            > "${PKG_DIR}/DEBIAN/control"
 
-          # Create copyright file
           cp rp1-jtag/LICENSE "${PKG_DIR}/usr/share/doc/openfpgaloader-rp1pio/copyright"
 
-          # Build the .deb
           dpkg-deb --build "${PKG_DIR}"
           ls -lh "${PKG_DIR}.deb"
 

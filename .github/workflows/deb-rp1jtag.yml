@@ -19,7 +19,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y \
-            build-essential cmake debhelper devscripts fakeroot git
+            build-essential cmake debhelper fakeroot git
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,11 +27,14 @@ jobs:
       - name: Build Debian packages
         run: dpkg-buildpackage -us -uc -b
 
-      - name: List built packages
-        run: ls -lh ../*.deb
+      - name: Collect built packages
+        run: |
+          mkdir -p built-debs
+          cp ../*.deb built-debs/
+          ls -lh built-debs/
 
-      - name: Upload librp1jtag0 deb
+      - name: Upload debs
         uses: actions/upload-artifact@v4
         with:
           name: debs-rp1jtag-${{ matrix.distro }}
-          path: ../*.deb
+          path: built-debs/*.deb

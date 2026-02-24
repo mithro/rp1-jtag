@@ -5,6 +5,8 @@ Maintainer: Tim Ansell <tim@mithis.com>
 Build-Depends: debhelper-compat (= 13), cmake (>= 3.16)
 Standards-Version: 4.6.2
 Homepage: https://github.com/mithro/rp1-jtag
+Vcs-Git: https://github.com/mithro/rp1-jtag.git
+Vcs-Browser: https://github.com/mithro/rp1-jtag
 
 Package: librp1jtag0
 Architecture: any

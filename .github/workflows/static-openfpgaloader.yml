@@ -15,11 +15,11 @@ jobs:
         run: |
           apk add --no-cache \
             build-base cmake git python3 pkgconf \
-            libftdi1-dev libftdi1-static \
+            libftdi1-dev \
             libusb-dev libusb-static \
             eudev-dev eudev-static \
             zlib-dev zlib-static \
-            hidapi-dev hidapi-static \
+            hidapi-dev \
             linux-headers \
             argp-standalone
 
@@ -48,13 +48,13 @@ jobs:
           cmake -B openFPGALoader/build -S openFPGALoader \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_RP1_PIO=ON \
-            -DBUILD_STATIC=ON
+            -DCMAKE_EXE_LINKER_FLAGS="-static" \
+            -DCMAKE_FIND_LIBRARY_SUFFIXES=".a"
           cmake --build openFPGALoader/build --parallel
 
       - name: Verify static linking
         run: |
           file openFPGALoader/build/openFPGALoader
-          # Verify the binary is statically linked
           file openFPGALoader/build/openFPGALoader | grep -q "statically linked"
 
       - name: Upload static binary

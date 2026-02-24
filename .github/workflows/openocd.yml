@@ -85,13 +85,15 @@ jobs:
         run: |
           apk add --no-cache \
             build-base cmake git python3 pkgconf \
-            libftdi1-dev libftdi1-static \
+            libftdi1-dev \
             libusb-dev libusb-static \
             eudev-dev eudev-static \
             zlib-dev zlib-static \
+            hidapi-dev \
             linux-headers \
             libtool automake autoconf \
-            jimtcl-dev capstone-dev
+            jimtcl-dev capstone-dev \
+            argp-standalone
 
       - name: Checkout rp1-jtag
         uses: actions/checkout@v4
