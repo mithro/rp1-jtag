@@ -86,8 +86,8 @@ jobs:
           apk add --no-cache \
             build-base cmake git python3 pkgconf \
             libftdi1-dev \
-            libusb-dev libusb-static \
-            eudev-dev eudev-static \
+            libusb-dev \
+            eudev-dev \
             zlib-dev zlib-static \
             hidapi-dev \
             linux-headers \
