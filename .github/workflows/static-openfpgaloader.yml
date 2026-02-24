@@ -49,6 +49,13 @@ jobs:
               git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git /work/openFPGALoader
               python3 /work/rp1-jtag/drivers/openfpgaloader/integrate.py /work/openFPGALoader
 
+              # Remove .so files so the linker only finds static .a libs.
+              # This is necessary because pkg-config returns -l flags that
+              # cause the linker to find .so before .a even with -static.
+              find /usr/lib -name "*.so" -o -name "*.so.*" | \
+                grep -E "(libftdi|libusb|libudev|libhidapi|librp1jtag)" | \
+                xargs rm -f
+
               # Build openFPGALoader (static)
               cmake -B /work/openFPGALoader/build -S /work/openFPGALoader \
                 -DCMAKE_BUILD_TYPE=Release \
