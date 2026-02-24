@@ -8,57 +8,63 @@ jobs:
   build-static:
     name: static arm64
     runs-on: ubuntu-24.04-arm
-    container: alpine:latest
+    # NOTE: We do NOT use container: alpine here because JS actions
+    # (checkout, upload-artifact) don't work in Alpine on ARM64 runners.
+    # Instead we run the build inside docker manually.
 
     steps:
-      - name: Install build dependencies
-        run: |
-          apk add --no-cache \
-            build-base cmake git python3 pkgconf \
-            libftdi1-dev \
-            libusb-dev \
-            eudev-dev \
-            zlib-dev zlib-static \
-            hidapi-dev \
-            linux-headers \
-            argp-standalone
-
       - name: Checkout rp1-jtag
         uses: actions/checkout@v4
-        with:
-          path: rp1-jtag
 
-      - name: Build and install librp1jtag (static)
-        working-directory: rp1-jtag
+      - name: Build static openFPGALoader in Alpine container
         run: |
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr
-          cmake --build build --parallel
-          cmake --install build
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /work \
+            alpine:latest sh -c '
+              set -ex
 
-      - name: Clone openFPGALoader
-        run: git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git
+              # Install build dependencies
+              apk add --no-cache \
+                build-base cmake git python3 pkgconf \
+                libftdi1-dev \
+                libusb-dev \
+                eudev-dev \
+                zlib-dev zlib-static \
+                hidapi-dev \
+                linux-headers \
+                argp-standalone
 
-      - name: Patch openFPGALoader with rp1-jtag driver
-        run: python3 rp1-jtag/drivers/openfpgaloader/integrate.py openFPGALoader
+              # Copy source (avoid modifying the mounted checkout)
+              cp -a /src /work/rp1-jtag
 
-      - name: Build openFPGALoader (static)
-        run: |
-          cmake -B openFPGALoader/build -S openFPGALoader \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_RP1_PIO=ON \
-            -DCMAKE_EXE_LINKER_FLAGS="-static" \
-            -DCMAKE_FIND_LIBRARY_SUFFIXES=".a"
-          cmake --build openFPGALoader/build --parallel
+              # Build and install librp1jtag
+              cmake -B /work/rp1-jtag/build /work/rp1-jtag \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr
+              cmake --build /work/rp1-jtag/build --parallel
+              cmake --install /work/rp1-jtag/build
 
-      - name: Verify static linking
-        run: |
-          file openFPGALoader/build/openFPGALoader
-          file openFPGALoader/build/openFPGALoader | grep -q "statically linked"
+              # Clone and patch openFPGALoader
+              git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git /work/openFPGALoader
+              python3 /work/rp1-jtag/drivers/openfpgaloader/integrate.py /work/openFPGALoader
+
+              # Build openFPGALoader (static)
+              cmake -B /work/openFPGALoader/build -S /work/openFPGALoader \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DENABLE_RP1_PIO=ON \
+                -DCMAKE_EXE_LINKER_FLAGS="-static" \
+                -DCMAKE_FIND_LIBRARY_SUFFIXES=".a"
+              cmake --build /work/openFPGALoader/build --parallel
+
+              # Verify and copy out
+              file /work/openFPGALoader/build/openFPGALoader
+              file /work/openFPGALoader/build/openFPGALoader | grep -q "statically linked"
+              cp /work/openFPGALoader/build/openFPGALoader /src/openFPGALoader
+            '
 
       - name: Upload static binary
         uses: actions/upload-artifact@v4
         with:
           name: static-openfpgaloader-arm64
-          path: openFPGALoader/build/openFPGALoader
+          path: openFPGALoader
