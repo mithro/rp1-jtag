@@ -38,7 +38,7 @@ jobs:
               # Copy source (avoid modifying the mounted checkout)
               cp -a /src /work/rp1-jtag
 
-              # Build and install librp1jtag
+              # Build and install librp1jtag (needs shared libs during build)
               cmake -B /work/rp1-jtag/build /work/rp1-jtag \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX=/usr
@@ -49,19 +49,20 @@ jobs:
               git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git /work/openFPGALoader
               python3 /work/rp1-jtag/drivers/openfpgaloader/integrate.py /work/openFPGALoader
 
-              # Remove .so files so the linker only finds static .a libs.
-              # This is necessary because pkg-config returns -l flags that
-              # cause the linker to find .so before .a even with -static.
-              find /usr/lib -name "*.so" -o -name "*.so.*" | \
-                grep -E "(libftdi|libusb|libudev|libhidapi|librp1jtag)" | \
-                xargs rm -f
+              # Force static linking: remove all .so files for our deps
+              # so CMake and the linker can only find .a archives.
+              # Must be done BEFORE cmake configure so find_library/pkg-config
+              # resolve to .a paths, not .so paths.
+              for lib in libftdi1 libusb-1.0 libudev libhidapi-hidraw \
+                         libhidapi-libusb librp1jtag; do
+                rm -f /usr/lib/${lib}.so /usr/lib/${lib}.so.*
+              done
 
               # Build openFPGALoader (static)
               cmake -B /work/openFPGALoader/build -S /work/openFPGALoader \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DENABLE_RP1_PIO=ON \
-                -DCMAKE_EXE_LINKER_FLAGS="-static" \
-                -DCMAKE_FIND_LIBRARY_SUFFIXES=".a"
+                -DCMAKE_EXE_LINKER_FLAGS="-static"
               cmake --build /work/openFPGALoader/build --parallel
 
               # Verify and copy out
