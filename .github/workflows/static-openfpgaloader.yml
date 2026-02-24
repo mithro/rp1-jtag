@@ -27,7 +27,7 @@ jobs:
               # Install build dependencies
               apk add --no-cache \
                 build-base cmake git python3 pkgconf \
-                libftdi1-dev \
+                libftdi1-dev libftdi1-static \
                 libusb-dev \
                 eudev-dev \
                 zlib-dev zlib-static \
