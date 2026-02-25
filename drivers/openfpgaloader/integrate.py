@@ -187,6 +187,11 @@ def main() -> None:
     link_block = (
         '\nif (ENABLE_RP1_PIO)\n'
         '\ttarget_link_libraries(openFPGALoader rp1jtag)\n'
+        '\t# PIOLib is a transitive dependency of librp1jtag (needed for static linking)\n'
+        '\tfind_library(PIOLIB_LIBRARY pio)\n'
+        '\tif(PIOLIB_LIBRARY)\n'
+        '\t\ttarget_link_libraries(openFPGALoader ${PIOLIB_LIBRARY})\n'
+        '\tendif()\n'
         '\tadd_definitions(-DENABLE_RP1_PIO=1)\n'
         'endif(ENABLE_RP1_PIO)\n'
     )
