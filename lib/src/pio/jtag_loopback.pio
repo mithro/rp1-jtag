@@ -1,0 +1,40 @@
+;
+; jtag_loopback.pio - TX->RX internal loopback for testing
+;
+; Copies TX FIFO data to RX FIFO without using GPIO pins.
+; Tests the full host<->PIO data path (PIOLib RPC, kernel ioctl,
+; PIO SM, FIFO, DMA) without external hardware or wiring.
+;
+; Pin assignment:
+;   - SIDESET pin 0: TCK (still toggles for realistic timing)
+;   - OUT and IN pins: not used (data goes FIFO-to-FIFO)
+;
+; TX FIFO protocol: same as jtag_shift
+;   Word 0:   bit_count - 1 (loop counter)
+;   Word 1..N: data words, 32 bits each
+;
+; RX FIFO output:
+;   Exact copy of input data words.
+;
+; The loopback works by reading 1 bit at a time from TX FIFO (via
+; autopull into OSR, then out to scratch Y), then shifting that bit
+; into ISR (via in y, 1). When ISR accumulates 32 bits, autopush
+; sends it to RX FIFO. The final partial word is flushed by explicit
+; push.
+;
+; Timing matches jtag_shift (5 cycles/bit) so throughput measurements
+; are representative.
+;
+
+.program jtag_loopback
+.side_set 1
+
+    pull            side 0      ; Get bit count from TX FIFO
+    out x, 32       side 0      ; Load into X as loop counter
+loop:
+    out y, 1        side 0      ; Read 1 bit from TX FIFO into Y
+    nop             side 0      ; Match jtag_shift setup timing
+    nop             side 1      ; TCK rising edge (realistic timing)
+    in y, 1         side 1      ; Shift Y bit 0 into ISR (accumulates)
+    jmp x-- loop    side 0      ; TCK falling edge, loop
+    push            side 0      ; Flush remaining bits to RX FIFO

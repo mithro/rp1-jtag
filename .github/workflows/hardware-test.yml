@@ -1,0 +1,73 @@
+name: Hardware tests (RPi 5) [placeholder]
+
+on:
+  workflow_dispatch:
+    inputs:
+      tests:
+        description: 'Which hardware tests to run'
+        required: false
+        default: 'loopback'
+        type: choice
+        options:
+          - loopback
+          - all
+
+# This workflow will SSH into a Raspberry Pi 5 with a NeTV2 FPGA board
+# connected via JTAG, build the project with PIOLib, and run the
+# hardware integration tests.
+#
+# Required secrets:
+#   HARDWARE_SSH_KEY  — private SSH key for the test RPi
+#   HARDWARE_SSH_HOST — hostname/IP (default: 10.1.10.14)
+#   HARDWARE_SSH_USER — username (default: tim)
+
+jobs:
+  hardware-test:
+    name: RPi 5 hardware tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # TODO: Set up SSH connection to RPi 5
+      # - name: Configure SSH
+      #   run: |
+      #     mkdir -p ~/.ssh
+      #     echo "${{ secrets.HARDWARE_SSH_KEY }}" > ~/.ssh/id_ed25519
+      #     chmod 600 ~/.ssh/id_ed25519
+      #     ssh-keyscan -H ${{ secrets.HARDWARE_SSH_HOST || '10.1.10.14' }} >> ~/.ssh/known_hosts
+
+      # TODO: Copy source to RPi and build with PIOLib
+      # - name: Build on RPi 5
+      #   run: |
+      #     SSH_TARGET="${{ secrets.HARDWARE_SSH_USER || 'tim' }}@${{ secrets.HARDWARE_SSH_HOST || '10.1.10.14' }}"
+      #     rsync -az --delete . "${SSH_TARGET}:~/rp1-jtag-ci/"
+      #     ssh "${SSH_TARGET}" 'cd ~/rp1-jtag-ci && cmake -B build && cmake --build build'
+
+      # TODO: Run hardware tests (require sudo for /dev/pio0)
+      # - name: Run loopback tests
+      #   run: |
+      #     SSH_TARGET="${{ secrets.HARDWARE_SSH_USER || 'tim' }}@${{ secrets.HARDWARE_SSH_HOST || '10.1.10.14' }}"
+      #     ssh "${SSH_TARGET}" 'cd ~/rp1-jtag-ci && sudo ./build/tests/hardware/test_pio_loopback'
+      #
+      # - name: Run IDCODE test (needs NeTV2)
+      #   if: inputs.tests == 'all'
+      #   run: |
+      #     SSH_TARGET="${{ secrets.HARDWARE_SSH_USER || 'tim' }}@${{ secrets.HARDWARE_SSH_HOST || '10.1.10.14' }}"
+      #     ssh "${SSH_TARGET}" 'cd ~/rp1-jtag-ci && sudo ./build/tests/hardware/test_idcode'
+
+      - name: Placeholder notice
+        run: |
+          echo "::warning::Hardware testing is not yet implemented"
+          echo ""
+          echo "This workflow will eventually:"
+          echo "  1. SSH into a Raspberry Pi 5 test target"
+          echo "  2. Build rp1-jtag with PIOLib support"
+          echo "  3. Run hardware integration tests:"
+          echo "     - test_pio_loopback  (no wiring needed)"
+          echo "     - test_gpio_loopback (1 jumper: TDI→TDO)"
+          echo "     - test_idcode        (needs NeTV2 FPGA)"
+          echo "     - test_bitstream     (needs NeTV2 FPGA)"
+          echo ""
+          echo "Required secrets: HARDWARE_SSH_KEY, HARDWARE_SSH_HOST, HARDWARE_SSH_USER"

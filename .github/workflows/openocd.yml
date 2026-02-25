@@ -1,0 +1,114 @@
+name: OpenOCD (rp1-jtag) [placeholder]
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # ---------- Debian packages ----------
+  build-deb:
+    name: deb (${{ matrix.distro }})
+    runs-on: ubuntu-24.04-arm
+    container: debian:${{ matrix.distro }}
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [bookworm, trixie]
+
+    steps:
+      - name: Install build tooling
+        run: |
+          apt-get update
+          apt-get install -y \
+            build-essential cmake git pkg-config python3 \
+            libftdi1-dev libusb-1.0-0-dev zlib1g-dev \
+            libtool automake autoconf \
+            libjim-dev libcapstone-dev libgpiod-dev
+
+      - name: Checkout rp1-jtag
+        uses: actions/checkout@v4
+        with:
+          path: rp1-jtag
+
+      - name: Build and install librp1jtag
+        working-directory: rp1-jtag
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build build --parallel
+          cmake --install build
+          ldconfig
+
+      - name: Clone OpenOCD fork
+        id: clone
+        continue-on-error: true
+        run: git clone --depth 1 https://github.com/mithro/OpenOCD.git
+
+      - name: Check if OpenOCD driver exists
+        id: check-driver
+        run: |
+          if [ ! -d "OpenOCD" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::OpenOCD fork not available yet"
+          elif [ ! -d "rp1-jtag/drivers/openocd" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::OpenOCD driver not yet implemented in rp1-jtag"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # TODO: Implement when OpenOCD driver is ready
+      # Steps will mirror deb-openfpgaloader.yml:
+      #   - Patch OpenOCD with rp1-jtag driver (integrate script TBD)
+      #   - Build OpenOCD with rp1-jtag support
+      #   - Package into .deb
+      - name: Placeholder — build and package
+        if: steps.check-driver.outputs.skip != 'true'
+        run: |
+          echo "TODO: Integrate rp1-jtag driver into OpenOCD"
+          echo "TODO: Build OpenOCD with rp1-jtag support"
+          echo "TODO: Package as .deb"
+
+      - name: Skip notice
+        if: steps.check-driver.outputs.skip == 'true'
+        run: echo "Skipping — OpenOCD rp1-jtag integration not yet available"
+
+  # ---------- Static binary ----------
+  build-static:
+    name: static arm64
+    runs-on: ubuntu-24.04-arm
+    # NOTE: When implemented, this will use docker run alpine:latest
+    # (not container: alpine) because JS actions don't work in Alpine
+    # containers on ARM64 runners.
+
+    steps:
+      - name: Checkout rp1-jtag
+        uses: actions/checkout@v4
+
+      - name: Check if OpenOCD driver exists
+        id: check-driver
+        run: |
+          if [ ! -d "drivers/openocd" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::OpenOCD driver not yet implemented in rp1-jtag"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # TODO: Implement when OpenOCD driver is ready
+      # Will use docker run alpine:latest (like static-openfpgaloader.yml):
+      #   - Build librp1jtag statically inside Alpine container
+      #   - Clone and patch OpenOCD
+      #   - Build OpenOCD statically
+      #   - Verify static linking
+      #   - Copy binary out for artifact upload
+      - name: Placeholder — build static binary
+        if: steps.check-driver.outputs.skip != 'true'
+        run: |
+          echo "TODO: Build OpenOCD statically in Alpine container"
+          echo "TODO: Verify static linking"
+
+      - name: Skip notice
+        if: steps.check-driver.outputs.skip == 'true'
+        run: echo "Skipping — OpenOCD rp1-jtag integration not yet available"

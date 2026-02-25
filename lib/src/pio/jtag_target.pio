@@ -1,0 +1,55 @@
+;
+; jtag_target.pio - JTAG target on SM1 for GPIO loopback testing
+;
+; Runs on a second state machine (SM1) using separate GPIO pins.
+; Acts as a simple JTAG target: samples TDI on TCK rising edge,
+; drives TDO on TCK falling edge with 1-bit delay.
+;
+; This allows testing the full JTAG data path through real GPIO
+; hardware without needing an FPGA. User wires host SM's output
+; GPIOs to target SM's input GPIOs with 4 jumper wires.
+;
+; Wiring:
+;   Host SM0 GPIO  4 (TCK out) --> Target SM1 GPIO A (TCK in)
+;   Host SM0 GPIO 17 (TMS out) --> Target SM1 GPIO B (TMS in)
+;   Host SM0 GPIO 27 (TDI out) --> Target SM1 GPIO C (TDI in, IN pin)
+;   Host SM0 GPIO 22 (TDO in)  <-- Target SM1 GPIO D (TDO out, OUT pin)
+;
+; GPIOs A-D are configurable (e.g., 5, 6, 12, 13).
+;
+; Pin assignment:
+;   - IN pin 0:  target TDI (receives host's TDI output)
+;   - OUT pin 0: target TDO (drives host's TDO input)
+;   - No SIDESET (target doesn't drive TCK)
+;
+; TCK is monitored via 'wait gpio N' using absolute GPIO number.
+; The GPIO number must be patched before loading (or the program
+; generated dynamically) since 'wait gpio' uses absolute numbers.
+;
+; Behavior: Simple shift register loopback
+;   - TDI sampled on TCK rising edge
+;   - TDO driven with previous TDI value on TCK falling edge
+;   - 1-bit delay between TDI input and TDO output
+;
+; This is sufficient for testing data integrity, bit ordering,
+; and throughput. Higher-sophistication modes (IDCODE responder,
+; full TAP) can be added incrementally.
+;
+
+.program jtag_target
+
+; NOTE: TCK_GPIO below is a placeholder. The actual GPIO number
+; must be set at load time. In the generated .pio.h, this will
+; be parameterized. The loader patches the 'wait' instructions
+; with the correct GPIO number before loading to the PIO.
+
+.wrap_target
+    wait 1 gpio 5               ; Wait for TCK rising edge (GPIO 5 = placeholder)
+    in pins, 1                   ; Sample TDI into ISR
+    out pins, 1                  ; Drive TDO from OSR (previous bit)
+    wait 0 gpio 5               ; Wait for TCK falling edge
+.wrap
+
+; Initial state: OSR should be preloaded with 0 (or don't care).
+; The first TDO output is undefined (no previous TDI).
+; After that, TDO = TDI delayed by 1 TCK cycle.
