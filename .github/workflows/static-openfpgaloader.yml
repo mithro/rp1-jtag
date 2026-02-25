@@ -147,13 +147,15 @@ jobs:
               # Copy source (avoid modifying the mounted checkout)
               cp -a /src /work/rp1-jtag
 
-              # Build and install libgpiod from source (no static package in Alpine)
-              wget https://www.kernel.org/pub/software/libs/libgpiod/libgpiod-2.2.3.tar.gz
-              tar xf libgpiod-2.2.3.tar.gz
-              cd libgpiod-2.2.3
+              # Build and install libgpiod v1 from source (v1 for kernel 4.8+ compat)
+              # ARM32 targets old RPi models that may run kernels older than 5.10,
+              # so we use libgpiod v1 (chardev v1 ABI) instead of v2 (chardev v2 ABI).
+              wget https://www.kernel.org/pub/software/libs/libgpiod/libgpiod-1.6.5.tar.gz
+              tar xf libgpiod-1.6.5.tar.gz
+              cd libgpiod-1.6.5
               ./configure --enable-static --disable-shared --prefix=/usr \
                 --disable-tools --disable-tests \
-                --disable-bindings-cxx --disable-bindings-python --disable-bindings-rust
+                --disable-bindings-cxx --disable-bindings-python
               make -j$(nproc)
               make install
               cd /work
