@@ -5,8 +5,9 @@ build/
 *.so
 *.dylib
 
-# IDE
+# IDE / AI
 .vscode/
+.claude/
 .idea/
 compile_commands.json
 
