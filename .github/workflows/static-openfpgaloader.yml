@@ -38,7 +38,16 @@ jobs:
               # Copy source (avoid modifying the mounted checkout)
               cp -a /src /work/rp1-jtag
 
-              # Build and install librp1jtag (needs shared libs during build)
+              # Build and install PIOLib (provides /dev/pio0 hardware access)
+              git clone --depth 1 https://github.com/raspberrypi/utils.git /work/rpi-utils
+              cmake -B /work/rpi-utils/piolib/build /work/rpi-utils/piolib \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr \
+                -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+              cmake --build /work/rpi-utils/piolib/build --parallel
+              cmake --install /work/rpi-utils/piolib/build
+
+              # Build and install librp1jtag (with PIOLib support)
               cmake -B /work/rp1-jtag/build /work/rp1-jtag \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX=/usr
@@ -56,7 +65,7 @@ jobs:
               rm -rf /usr/lib/cmake/libftdi1
               # 2. Remove all .so files so the linker can only find .a
               for lib in libftdi1 libusb-1.0 libudev libhidapi-hidraw \
-                         libhidapi-libusb librp1jtag; do
+                         libhidapi-libusb librp1jtag libpio; do
                 rm -f /usr/lib/${lib}.so /usr/lib/${lib}.so.*
               done
 
