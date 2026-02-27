@@ -17,10 +17,9 @@ static const uint16_t jtag_shift_program[] = {
     0x6020, /*  1: out    x, 32           side 0 */
     0x6001, /*  2: out    pins, 1         side 0 */
     0xa042, /*  3: nop                    side 0 */
-    0xb042, /*  4: nop                    side 1 */
-    0x5001, /*  5: in     pins, 1         side 1 */
-    0x0042, /*  6: jmp    x--, 2          side 0 */
-    0x8020, /*  7: push   block           side 0 */
+    0x5001, /*  4: in     pins, 1         side 1 */
+    0x0042, /*  5: jmp    x--, 2          side 0 */
+    0x8020, /*  6: push   block           side 0 */
 };
 
 #define TCK_PIN 4
@@ -52,7 +51,7 @@ static int tests_failed = 0;
 
 static pio_sim_t *create_sim(void)
 {
-    pio_sim_t *sim = pio_sim_create(jtag_shift_program, 8);
+    pio_sim_t *sim = pio_sim_create(jtag_shift_program, 7);
     if (!sim) return NULL;
 
     pio_sim_set_sideset(sim, 1, false, TCK_PIN);
@@ -60,7 +59,7 @@ static pio_sim_t *create_sim(void)
     pio_sim_set_in_pins(sim, TDO_PIN);
     pio_sim_set_out_shift(sim, true, true, 32);    /* LSB-first, autopull at 32 */
     pio_sim_set_in_shift(sim, true, true, 32);      /* LSB-first, autopush at 32 */
-    pio_sim_set_wrap(sim, 0, 7);
+    pio_sim_set_wrap(sim, 0, 6);
 
     return sim;
 }
@@ -84,9 +83,8 @@ static void test_tdi_lsb_first(void)
     pio_sim_step(sim);  /* out pins, 1 */
     ASSERT(!pio_sim_gpio_get_pin(sim, TDI_PIN), "bit 0 of 0x0A should be 0");
 
-    /* Skip rest of bit 0 cycle */
+    /* Skip rest of bit 0 cycle (4 instructions per bit: out, nop, in, jmp) */
     pio_sim_step(sim);  /* nop */
-    pio_sim_step(sim);  /* nop side 1 */
     pio_sim_step(sim);  /* in */
     pio_sim_step(sim);  /* jmp */
 
@@ -94,13 +92,13 @@ static void test_tdi_lsb_first(void)
     pio_sim_step(sim);  /* out pins, 1 */
     ASSERT(pio_sim_gpio_get_pin(sim, TDI_PIN), "bit 1 of 0x0A should be 1");
 
-    pio_sim_step(sim);  pio_sim_step(sim);  pio_sim_step(sim);  pio_sim_step(sim);
+    pio_sim_step(sim);  pio_sim_step(sim);  pio_sim_step(sim);
 
     /* Bit 2: should drive TDI=0 (bit 2 of 0x0A = 0) */
     pio_sim_step(sim);
     ASSERT(!pio_sim_gpio_get_pin(sim, TDI_PIN), "bit 2 of 0x0A should be 0");
 
-    pio_sim_step(sim);  pio_sim_step(sim);  pio_sim_step(sim);  pio_sim_step(sim);
+    pio_sim_step(sim);  pio_sim_step(sim);  pio_sim_step(sim);
 
     /* Bit 3: should drive TDI=1 (bit 3 of 0x0A = 1) */
     pio_sim_step(sim);
@@ -131,25 +129,27 @@ static void test_tdo_bit_positions(void)
     pio_sim_gpio_set(sim, TDO_PIN, true);
     pio_sim_step(sim);  /* out pins,1 side 0 */
     pio_sim_step(sim);  /* nop side 0 */
-    pio_sim_step(sim);  /* nop side 1 -- rising edge */
     pio_sim_step(sim);  /* in pins,1 side 1 -- samples TDO=1 */
     pio_sim_step(sim);  /* jmp */
 
     /* Bit 1: set TDO=0 */
     pio_sim_gpio_set(sim, TDO_PIN, false);
-    pio_sim_step(sim);  pio_sim_step(sim);  pio_sim_step(sim);
+    pio_sim_step(sim);  /* out pins,1 */
+    pio_sim_step(sim);  /* nop */
     pio_sim_step(sim);  /* in pins,1 -- samples TDO=0 */
     pio_sim_step(sim);  /* jmp */
 
     /* Bit 2: set TDO=1 */
     pio_sim_gpio_set(sim, TDO_PIN, true);
-    pio_sim_step(sim);  pio_sim_step(sim);  pio_sim_step(sim);
+    pio_sim_step(sim);  /* out pins,1 */
+    pio_sim_step(sim);  /* nop */
     pio_sim_step(sim);  /* in pins,1 -- samples TDO=1 */
     pio_sim_step(sim);  /* jmp */
 
     /* Bit 3: set TDO=0 */
     pio_sim_gpio_set(sim, TDO_PIN, false);
-    pio_sim_step(sim);  pio_sim_step(sim);  pio_sim_step(sim);
+    pio_sim_step(sim);  /* out pins,1 */
+    pio_sim_step(sim);  /* nop */
     pio_sim_step(sim);  /* in pins,1 -- samples TDO=0 */
     pio_sim_step(sim);  /* jmp -- x=0, fall through */
 
@@ -163,8 +163,6 @@ static void test_tdo_bit_positions(void)
     /* With right-shift IN, bits enter at MSB:
      * After 4 shifts: bits are at [31:28] = {bit3, bit2, bit1, bit0}
      * bit0=1 entered first (goes to bit 31)
-     * bit1=0 next (goes to bit 30, bit0 shifts to bit 30... wait)
-     *
      * Right shift IN: ISR >>= 1; ISR |= (bit << 31)
      * After bit0 (1): ISR = 0x80000000
      * After bit1 (0): ISR = 0x40000000  (shifted right, new 0 at MSB)
