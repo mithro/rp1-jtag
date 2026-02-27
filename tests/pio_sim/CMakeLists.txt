@@ -14,9 +14,9 @@ add_executable(test_jtag_shift test_jtag_shift.c)
 target_link_libraries(test_jtag_shift pio_sim)
 add_test(NAME pio_sim_jtag_shift COMMAND test_jtag_shift)
 
-add_executable(test_jtag_shift_fast test_jtag_shift_fast.c)
-target_link_libraries(test_jtag_shift_fast pio_sim)
-add_test(NAME pio_sim_jtag_shift_fast COMMAND test_jtag_shift_fast)
+add_executable(test_jtag_tms test_jtag_tms.c)
+target_link_libraries(test_jtag_tms pio_sim)
+add_test(NAME pio_sim_jtag_tms COMMAND test_jtag_tms)
 
 add_executable(test_bit_ordering test_bit_ordering.c)
 target_link_libraries(test_bit_ordering pio_sim)
