@@ -1,45 +1,45 @@
 ;
-; jtag_shift.pio - Counted JTAG shift loop (Phase 1)
+; jtag_shift.pio - Counted JTAG shift with DMA (Phase 2)
 ;
-; 5 instructions per bit. Single PIO program for all transfers.
+; 4 instructions per bit in the loop. Used with SM1 (jtag_tms.pio)
+; for concurrent TMS control.
 ;
 ; Pin assignment:
 ;   - SIDESET pin 0: TCK (toggled automatically by every instruction)
 ;   - OUT pin 0:     TDI (data shifted out from TX FIFO)
 ;   - IN pin 0:      TDO (data shifted in to RX FIFO)
-;   - TMS:           Controlled by host via GPIO (not a PIO pin)
+;   - TMS:           Controlled by SM1 via jtag_tms.pio (not this SM)
 ;
-; TX FIFO protocol:
-;   Word 0:   bit_count - 1 (loop counter)
-;   Word 1..N: TDI data, LSB-first, 32 bits per word
+; TX FIFO protocol (fed by DMA):
+;   Word 0:    bit_count - 1 (loop counter, loaded via pull + out x)
+;   Word 1..N: TDI data, LSB-first, 32 bits per word (autopull)
 ;
-; RX FIFO output:
-;   TDO data, LSB-first, 32 bits per word.
-;   Final partial word is flushed by explicit push.
+; RX FIFO output (drained by DMA):
+;   TDO data, LSB-first, 32 bits per word (autopush).
+;   Final partial word flushed by explicit push.
 ;
-; JTAG timing (per bit):
-;   Cycle 0: OUT pins, 1  side 0  -- drive TDI, TCK low (setup begins)
-;   Cycle 1: nop           side 0  -- TDI setup time (extra cycle)
-;   Cycle 2: nop           side 1  -- TCK rising edge (target samples TDI+TMS)
-;   Cycle 3: in pins, 1   side 1  -- sample TDO (valid after rising edge)
-;   Cycle 4: jmp x-- loop side 0  -- TCK falling edge, decrement counter
+; JTAG timing (per bit, 4 cycles):
+;   Cycle 0: out pins, 1  side 0 -- TDI output, TCK LOW (setup begins)
+;   Cycle 1: nop           side 0 -- TMS setup time (SM1 sets TMS here)
+;   Cycle 2: in pins, 1   side 1 -- TCK HIGH (rising edge), sample TDO
+;   Cycle 3: jmp x--      side 0 -- TCK LOW (falling edge), loop
 ;
-; At 200 MHz PIO clock (5ns/cycle):
-;   - TDI setup before rising edge: 2 cycles = 10ns (Artix-7 needs 5ns min)
-;   - TDO valid time after rising edge: 1 cycle = 5ns
-;   - TCK period: 5 cycles = 25ns = 40 MHz max
-;   - Practical with clock divider: 3-10 MHz TCK
+; At 200 MHz PIO clock (5 ns/cycle):
+;   - TDI setup before rising edge: 2 cycles = 10 ns
+;   - TMS setup before rising edge: 1 cycle = 5 ns (set by SM1)
+;   - TDO sample after rising edge: same cycle
+;   - TCK period: 4 cycles = 20 ns = 50 MHz max
+;   - With divider 1.5: 33.3 MHz (Artix-7 max)
 ;
 
 .program jtag_shift
 .side_set 1
 
-    pull            side 0      ; Get bit count from TX FIFO
+    pull            side 0      ; Get bit count - 1 from TX FIFO
     out x, 32       side 0      ; Load into X as loop counter
 loop:
-    out pins, 1     side 0      ; Drive TDI, TCK stays low (setup)
-    nop             side 0      ; TDI setup time (extra cycle)
-    nop             side 1      ; TCK rising edge -- target samples TDI+TMS
-    in pins, 1      side 1      ; Sample TDO (valid after rising edge)
-    jmp x-- loop    side 0      ; TCK falling edge, loop
+    out pins, 1     side 0      ; Drive TDI, TCK LOW (setup phase)
+    nop             side 0      ; Extra cycle for TMS setup from SM1
+    in pins, 1      side 1      ; Sample TDO, TCK HIGH (rising edge)
+    jmp x-- loop    side 0      ; TCK LOW (falling edge), loop
     push            side 0      ; Flush remaining TDO bits to RX FIFO
