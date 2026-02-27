@@ -1,26 +1,18 @@
 
-# Unit tests (no hardware needed, uses mock PIOLib backend)
+# Unit tests (no hardware needed, pure calculation tests)
 
-# TMS run-length splitting
-add_executable(test_tms_splitting test_tms_splitting.c)
-target_link_libraries(test_tms_splitting rp1jtag_static)
-target_include_directories(test_tms_splitting PRIVATE
-    ${CMAKE_SOURCE_DIR}/lib/src
-)
-add_test(NAME unit_tms_splitting COMMAND test_tms_splitting)
-
-# FIFO interleaving
-add_executable(test_fifo_interleave test_fifo_interleave.c)
-target_link_libraries(test_fifo_interleave rp1jtag_static)
-target_include_directories(test_fifo_interleave PRIVATE
-    ${CMAKE_SOURCE_DIR}/lib/src
-)
-add_test(NAME unit_fifo_interleave COMMAND test_fifo_interleave)
-
-# Data packing
+# Data packing (bits_to_words / words_to_bits roundtrip)
 add_executable(test_data_packing test_data_packing.c)
 target_link_libraries(test_data_packing rp1jtag_static)
 target_include_directories(test_data_packing PRIVATE
     ${CMAKE_SOURCE_DIR}/lib/src
 )
 add_test(NAME unit_data_packing COMMAND test_data_packing)
+
+# DMA buffer layout (word counts, SM0/SM1 TX format, partial-word fix)
+add_executable(test_dma_buffer_packing test_dma_buffer_packing.c)
+target_link_libraries(test_dma_buffer_packing rp1jtag_static)
+target_include_directories(test_dma_buffer_packing PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/src
+)
+add_test(NAME unit_dma_buffer_packing COMMAND test_dma_buffer_packing)
