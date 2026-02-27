@@ -3,12 +3,11 @@
 
 include(GNUInstallDirs)
 
-# All sources always build. pio_backend_rp1.c has an #ifdef HAVE_PIOLIB
-# guard that provides a stub returning NULL when PIOLib is unavailable.
+# Single source file. The HAVE_PIOLIB #ifdef inside rp1_jtag.c provides
+# stub implementations when PIOLib is unavailable. Backend abstraction
+# layer is removed; PIOLib is called directly.
 set(LIB_SOURCES
     src/rp1_jtag.c
-    src/pio_backend_mock.c
-    src/pio_backend_rp1.c
 )
 
 # Build both shared and static libraries
