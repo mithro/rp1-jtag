@@ -8,57 +8,197 @@ jobs:
   build-static:
     name: static arm64
     runs-on: ubuntu-24.04-arm
-    container: alpine:latest
+    # NOTE: We do NOT use container: alpine here because JS actions
+    # (checkout, upload-artifact) don't work in Alpine on ARM64 runners.
+    # Instead we run the build inside docker manually.
 
     steps:
-      - name: Install build dependencies
-        run: |
-          apk add --no-cache \
-            build-base cmake git python3 pkgconf \
-            libftdi1-dev \
-            libusb-dev libusb-static \
-            eudev-dev eudev-static \
-            zlib-dev zlib-static \
-            hidapi-dev \
-            linux-headers \
-            argp-standalone
-
       - name: Checkout rp1-jtag
         uses: actions/checkout@v4
-        with:
-          path: rp1-jtag
 
-      - name: Build and install librp1jtag (static)
-        working-directory: rp1-jtag
+      - name: Build static openFPGALoader in Alpine container
         run: |
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr
-          cmake --build build --parallel
-          cmake --install build
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /work \
+            alpine:latest sh -c '
+              set -ex
 
-      - name: Clone openFPGALoader
-        run: git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git
+              # Install build dependencies
+              apk add --no-cache \
+                build-base cmake git python3 pkgconf \
+                libftdi1-dev libftdi1-static \
+                libusb-dev \
+                eudev-dev \
+                zlib-dev zlib-static \
+                hidapi-dev \
+                linux-headers \
+                argp-standalone \
+                autoconf automake libtool
 
-      - name: Patch openFPGALoader with rp1-jtag driver
-        run: python3 rp1-jtag/drivers/openfpgaloader/integrate.py openFPGALoader
+              # Copy source (avoid modifying the mounted checkout)
+              cp -a /src /work/rp1-jtag
 
-      - name: Build openFPGALoader (static)
-        run: |
-          cmake -B openFPGALoader/build -S openFPGALoader \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_RP1_PIO=ON \
-            -DCMAKE_EXE_LINKER_FLAGS="-static" \
-            -DCMAKE_FIND_LIBRARY_SUFFIXES=".a"
-          cmake --build openFPGALoader/build --parallel
+              # Build and install libgpiod from source (no static package in Alpine)
+              wget https://www.kernel.org/pub/software/libs/libgpiod/libgpiod-2.2.3.tar.gz
+              tar xf libgpiod-2.2.3.tar.gz
+              cd libgpiod-2.2.3
+              ./configure --enable-static --disable-shared --prefix=/usr \
+                --disable-tools --disable-tests \
+                --disable-bindings-cxx --disable-bindings-python --disable-bindings-rust
+              make -j$(nproc)
+              make install
+              cd /work
 
-      - name: Verify static linking
-        run: |
-          file openFPGALoader/build/openFPGALoader
-          file openFPGALoader/build/openFPGALoader | grep -q "statically linked"
+              # Build and install PIOLib (provides /dev/pio0 hardware access)
+              git clone --depth 1 https://github.com/raspberrypi/utils.git /work/rpi-utils
+              cmake -B /work/rpi-utils/piolib/build /work/rpi-utils/piolib \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr \
+                -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+              cmake --build /work/rpi-utils/piolib/build --parallel
+              cmake --install /work/rpi-utils/piolib/build
+
+              # Build and install librp1jtag (with PIOLib support)
+              cmake -B /work/rp1-jtag/build /work/rp1-jtag \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr
+              cmake --build /work/rp1-jtag/build --parallel
+              cmake --install /work/rp1-jtag/build
+
+              # Clone and patch openFPGALoader
+              git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git /work/openFPGALoader
+              python3 /work/rp1-jtag/drivers/openfpgaloader/integrate.py /work/openFPGALoader
+
+              # Force static linking:
+              # 1. Remove libftdi1 cmake config which hardcodes
+              #    /usr/lib/libusb-1.0.so in LIBFTDI_LIBRARIES.
+              #    This forces openFPGALoader to fall back to pkg-config.
+              rm -rf /usr/lib/cmake/libftdi1
+              # 2. Remove all .so files so the linker can only find .a
+              for lib in libftdi1 libusb-1.0 libudev libhidapi-hidraw \
+                         libhidapi-libusb librp1jtag libpio libgpiod; do
+                rm -f /usr/lib/${lib}.so /usr/lib/${lib}.so.*
+              done
+
+              # Build openFPGALoader (static)
+              cmake -B /work/openFPGALoader/build -S /work/openFPGALoader \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DENABLE_RP1_PIO=ON \
+                -DENABLE_LIBGPIOD=ON \
+                -DCMAKE_EXE_LINKER_FLAGS="-static"
+              cmake --build /work/openFPGALoader/build --parallel
+
+              # Verify and copy out
+              file /work/openFPGALoader/build/openFPGALoader
+              file /work/openFPGALoader/build/openFPGALoader | grep -qE "statically linked|static-pie linked"
+              cp /work/openFPGALoader/build/openFPGALoader /src/openFPGALoader
+            '
 
       - name: Upload static binary
         uses: actions/upload-artifact@v4
         with:
           name: static-openfpgaloader-arm64
-          path: openFPGALoader/build/openFPGALoader
+          path: openFPGALoader
+
+  build-static-arm32:
+    name: static ${{ matrix.arch }}
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        include:
+          - arch: armv7
+            docker_image: arm32v7/alpine:latest
+            platform: linux/arm/v7
+          - arch: armv6
+            docker_image: arm32v6/alpine:latest
+            platform: linux/arm/v6
+
+    steps:
+      - name: Checkout rp1-jtag
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU for ARM32 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Build static openFPGALoader in Alpine ARM32 container
+        run: |
+          docker run --rm \
+            --platform ${{ matrix.platform }} \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /work \
+            ${{ matrix.docker_image }} sh -c '
+              set -ex
+
+              # Install build dependencies
+              apk add --no-cache \
+                build-base cmake git python3 pkgconf \
+                libftdi1-dev libftdi1-static \
+                libusb-dev \
+                eudev-dev \
+                zlib-dev zlib-static \
+                hidapi-dev \
+                linux-headers \
+                argp-standalone \
+                autoconf automake libtool
+
+              # Copy source (avoid modifying the mounted checkout)
+              cp -a /src /work/rp1-jtag
+
+              # Build and install libgpiod v1 from source (v1 for kernel 4.8+ compat)
+              # ARM32 targets old RPi models that may run kernels older than 5.10,
+              # so we use libgpiod v1 (chardev v1 ABI) instead of v2 (chardev v2 ABI).
+              wget https://www.kernel.org/pub/software/libs/libgpiod/libgpiod-1.6.5.tar.gz
+              tar xf libgpiod-1.6.5.tar.gz
+              cd libgpiod-1.6.5
+              ./configure --enable-static --disable-shared --prefix=/usr \
+                --disable-tools --disable-tests \
+                --disable-bindings-cxx --disable-bindings-python
+              make -j$(nproc)
+              make install
+              cd /work
+
+              # Build and install librp1jtag (without PIOLib — not available on ARM32 RPi)
+              cmake -B /work/rp1-jtag/build /work/rp1-jtag \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr
+              cmake --build /work/rp1-jtag/build --parallel
+              cmake --install /work/rp1-jtag/build
+
+              # Clone and patch openFPGALoader
+              git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git /work/openFPGALoader
+              python3 /work/rp1-jtag/drivers/openfpgaloader/integrate.py /work/openFPGALoader
+
+              # Force static linking:
+              # 1. Remove libftdi1 cmake config which hardcodes
+              #    /usr/lib/libusb-1.0.so in LIBFTDI_LIBRARIES.
+              #    This forces openFPGALoader to fall back to pkg-config.
+              rm -rf /usr/lib/cmake/libftdi1
+              # 2. Remove all .so files so the linker can only find .a
+              for lib in libftdi1 libusb-1.0 libudev libhidapi-hidraw \
+                         libhidapi-libusb librp1jtag libgpiod; do
+                rm -f /usr/lib/${lib}.so /usr/lib/${lib}.so.*
+              done
+
+              # Build openFPGALoader (static)
+              # RP1_PIO=ON compiles without PIOLib (prints runtime warning)
+              cmake -B /work/openFPGALoader/build -S /work/openFPGALoader \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DENABLE_RP1_PIO=ON \
+                -DENABLE_LIBGPIOD=ON \
+                -DCMAKE_EXE_LINKER_FLAGS="-static"
+              cmake --build /work/openFPGALoader/build --parallel
+
+              # Verify and copy out
+              file /work/openFPGALoader/build/openFPGALoader
+              file /work/openFPGALoader/build/openFPGALoader | grep -qE "statically linked|static-pie linked"
+              cp /work/openFPGALoader/build/openFPGALoader /src/openFPGALoader
+            '
+
+      - name: Upload static binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-openfpgaloader-${{ matrix.arch }}
+          path: openFPGALoader
