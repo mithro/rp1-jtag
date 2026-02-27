@@ -8,6 +8,6 @@ add_subdirectory(pio_sim)
 add_subdirectory(unit)
 
 # Hardware integration tests (RPi 5 + optional FPGA)
-if(HAVE_PIOLIB)
-    add_subdirectory(hardware)
-endif()
+# These always build (stub functions when PIOLib is unavailable),
+# but only run on RPi 5 hardware.
+add_subdirectory(hardware)
