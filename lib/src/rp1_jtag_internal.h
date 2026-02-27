@@ -26,13 +26,13 @@
 /* Number of bits per FIFO word */
 #define BITS_PER_WORD           32
 
+/* Minimum DMA transfer size in bytes.
+ * PIOLib/kernel requires at least 8 bytes (2 words) for DMA transfers;
+ * single-word (4 byte) transfers time out on RP1. */
+#define MIN_DMA_BYTES           8
+
 /* PIO instructions per JTAG bit (jtag_shift program: 4 instruction loop) */
 #define INSTR_PER_BIT           4
-
-/* DMA FIFO threshold register value.
- * 0xC0000108: DREQ enable (bit 31) | threshold=8 (bits 4:0) | other config.
- * Ensures FIFO threshold matches the 8-beat burst of heavy DMA channels 0/1. */
-#define DMA_FIFO_THRESHOLD      0xC0000108
 
 /* Operating mode */
 typedef enum {
