@@ -14,6 +14,7 @@
 #define _GNU_SOURCE
 
 #include "rp1_jtag_internal.h"
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -111,12 +112,15 @@ typedef struct {
     size_t size;
     void *buf;
     int ret;
+    int err;    /* errno captured after pio_sm_xfer_data */
 } xfer_args_t;
 
 static void *xfer_thread(void *arg)
 {
     xfer_args_t *a = (xfer_args_t *)arg;
+    errno = 0;
     a->ret = pio_sm_xfer_data(a->pio, a->sm, a->dir, a->size, a->buf);
+    a->err = errno;
     return NULL;
 }
 
@@ -138,16 +142,26 @@ static int jtag_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
     uint sm1 = (uint)jtag->sm1;
     int ret = 0;
 
-    /* Calculate buffer sizes */
+    /* Calculate buffer sizes.
+     * Enforce MIN_DMA_BYTES since PIOLib can't DMA single words. */
     uint32_t num_data_words = bits_to_word_count(num_bits);
     size_t sm0_tx_bytes = (1 + num_data_words) * sizeof(uint32_t);  /* count + TDI */
     size_t sm0_rx_bytes = num_data_words * sizeof(uint32_t);        /* TDO */
     size_t sm1_tx_bytes = num_data_words * sizeof(uint32_t);        /* TMS */
 
-    /* Allocate aligned buffers for DMA */
-    uint32_t *sm0_tx = (uint32_t *)aligned_alloc(64, sm0_tx_bytes);
-    uint32_t *sm0_rx = (uint32_t *)aligned_alloc(64, sm0_rx_bytes);
-    uint32_t *sm1_tx = (uint32_t *)aligned_alloc(64, sm1_tx_bytes);
+    /* DMA transfer sizes (padded to minimum) */
+    size_t sm0_tx_dma = sm0_tx_bytes < MIN_DMA_BYTES ? MIN_DMA_BYTES : sm0_tx_bytes;
+    size_t sm0_rx_dma = sm0_rx_bytes < MIN_DMA_BYTES ? MIN_DMA_BYTES : sm0_rx_bytes;
+    size_t sm1_tx_dma = sm1_tx_bytes < MIN_DMA_BYTES ? MIN_DMA_BYTES : sm1_tx_bytes;
+
+    /* Allocate aligned buffers for DMA.
+     * C11 requires aligned_alloc size to be a multiple of alignment. */
+    size_t sm0_tx_alloc = (sm0_tx_dma + 63) & ~(size_t)63;
+    size_t sm0_rx_alloc = (sm0_rx_dma + 63) & ~(size_t)63;
+    size_t sm1_tx_alloc = (sm1_tx_dma + 63) & ~(size_t)63;
+    uint32_t *sm0_tx = (uint32_t *)aligned_alloc(64, sm0_tx_alloc);
+    uint32_t *sm0_rx = (uint32_t *)aligned_alloc(64, sm0_rx_alloc);
+    uint32_t *sm1_tx = (uint32_t *)aligned_alloc(64, sm1_tx_alloc);
     if (!sm0_tx || !sm0_rx || !sm1_tx) {
         free(sm0_tx);
         free(sm0_rx);
@@ -155,33 +169,35 @@ static int jtag_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
         return RP1_JTAG_ERR_IO;
     }
 
-    /* Pack data into word buffers */
+    /* Pack data into word buffers, zero-pad any DMA padding */
+    memset(sm0_tx, 0, sm0_tx_dma);
+    memset(sm1_tx, 0, sm1_tx_dma);
     sm0_tx[0] = num_bits - 1;                        /* count word */
     bits_to_words(tdi, 0, num_bits, &sm0_tx[1]);     /* TDI data */
     bits_to_words(tms, 0, num_bits, sm1_tx);         /* TMS data */
-    memset(sm0_rx, 0, sm0_rx_bytes);                 /* clear RX buffer */
+    memset(sm0_rx, 0, sm0_rx_dma);                   /* clear RX buffer */
 
     /* Configure DMA channels */
-    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, sm0_tx_bytes, 1);
+    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, sm0_tx_dma, 1);
     if (ret < 0) goto cleanup;
-    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM, sm0_rx_bytes, 1);
+    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM, sm0_rx_dma, 1);
     if (ret < 0) goto cleanup;
-    ret = pio_sm_config_xfer(pio, sm1, PIO_DIR_TO_SM, sm1_tx_bytes, 1);
+    ret = pio_sm_config_xfer(pio, sm1, PIO_DIR_TO_SM, sm1_tx_dma, 1);
     if (ret < 0) goto cleanup;
 
-    /* Set FIFO thresholds for heavy DMA channel burst size */
-    pio_sm_set_dmactrl(pio, sm0, true,  DMA_FIFO_THRESHOLD);  /* SM0 TX */
-    pio_sm_set_dmactrl(pio, sm0, false, DMA_FIFO_THRESHOLD);  /* SM0 RX */
-    pio_sm_set_dmactrl(pio, sm1, true,  DMA_FIFO_THRESHOLD);  /* SM1 TX */
+    /* NOTE: Do NOT call pio_sm_set_dmactrl() here. The kernel driver
+     * (PR #7190) already sets correct FIFO thresholds in config_xfer.
+     * Manually overriding with 0xC0000108 breaks RX DMA on newer kernels
+     * (causes ETIMEDOUT for transfers >= 128 bytes). */
 
     /* Enable both state machines */
     pio_sm_set_enabled(pio, sm0, true);
     pio_sm_set_enabled(pio, sm1, true);
 
     /* Launch 3 concurrent DMA threads */
-    xfer_args_t tx0 = {pio, sm0, PIO_DIR_TO_SM,   sm0_tx_bytes, sm0_tx, 0};
-    xfer_args_t rx0 = {pio, sm0, PIO_DIR_FROM_SM,  sm0_rx_bytes, sm0_rx, 0};
-    xfer_args_t tx1 = {pio, sm1, PIO_DIR_TO_SM,    sm1_tx_bytes, sm1_tx, 0};
+    xfer_args_t tx0 = {pio, sm0, PIO_DIR_TO_SM,   sm0_tx_dma, sm0_tx, 0, 0};
+    xfer_args_t rx0 = {pio, sm0, PIO_DIR_FROM_SM, sm0_rx_dma, sm0_rx, 0, 0};
+    xfer_args_t tx1 = {pio, sm1, PIO_DIR_TO_SM,   sm1_tx_dma, sm1_tx, 0, 0};
 
     pthread_t t_tx0, t_rx0, t_tx1;
     pthread_create(&t_tx0, NULL, xfer_thread, &tx0);
@@ -198,8 +214,11 @@ static int jtag_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
 
     /* Check for DMA errors */
     if (tx0.ret < 0 || rx0.ret < 0 || tx1.ret < 0) {
-        fprintf(stderr, "rp1_jtag: DMA transfer failed (tx0=%d, rx0=%d, tx1=%d)\n",
-                tx0.ret, rx0.ret, tx1.ret);
+        fprintf(stderr, "rp1_jtag: DMA transfer failed "
+                "(tx0=%d[%s], rx0=%d[%s], tx1=%d[%s])\n",
+                tx0.ret, strerror(tx0.err),
+                rx0.ret, strerror(rx0.err),
+                tx1.ret, strerror(tx1.err));
         ret = RP1_JTAG_ERR_IO;
         goto cleanup;
     }
@@ -246,39 +265,44 @@ static int loopback_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
     uint sm0 = (uint)jtag->sm0;
     int ret = 0;
 
-    /* Calculate buffer sizes (no count word for loopback) */
+    /* Calculate buffer sizes (no count word for loopback).
+     * Enforce MIN_DMA_BYTES since PIOLib can't DMA single words. */
     uint32_t num_data_words = bits_to_word_count(num_bits);
     size_t data_bytes = num_data_words * sizeof(uint32_t);
+    size_t dma_bytes = data_bytes < MIN_DMA_BYTES ? MIN_DMA_BYTES : data_bytes;
 
-    /* Allocate aligned buffers for DMA */
-    uint32_t *tx_buf = (uint32_t *)aligned_alloc(64, data_bytes);
-    uint32_t *rx_buf = (uint32_t *)aligned_alloc(64, data_bytes);
+    /* Allocate aligned buffers for DMA.
+     * C11 requires aligned_alloc size to be a multiple of alignment. */
+    size_t alloc_bytes = (dma_bytes + 63) & ~(size_t)63;
+    uint32_t *tx_buf = (uint32_t *)aligned_alloc(64, alloc_bytes);
+    uint32_t *rx_buf = (uint32_t *)aligned_alloc(64, alloc_bytes);
     if (!tx_buf || !rx_buf) {
         free(tx_buf);
         free(rx_buf);
         return RP1_JTAG_ERR_IO;
     }
 
-    /* Pack TDI data into word buffer */
+    /* Pack TDI data into word buffer, zero-pad remainder */
+    memset(tx_buf, 0, dma_bytes);
     bits_to_words(tdi, 0, num_bits, tx_buf);
-    memset(rx_buf, 0, data_bytes);
+    memset(rx_buf, 0, dma_bytes);
 
     /* Configure DMA channels */
-    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, data_bytes, 1);
+    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, dma_bytes, 1);
     if (ret < 0) goto cleanup;
-    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM, data_bytes, 1);
+    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM, dma_bytes, 1);
     if (ret < 0) goto cleanup;
 
-    /* Set FIFO thresholds */
-    pio_sm_set_dmactrl(pio, sm0, true,  DMA_FIFO_THRESHOLD);  /* TX */
-    pio_sm_set_dmactrl(pio, sm0, false, DMA_FIFO_THRESHOLD);  /* RX */
+    /* NOTE: Do NOT call pio_sm_set_dmactrl() here. The kernel driver
+     * (PR #7190) already sets correct FIFO thresholds in config_xfer.
+     * Manually overriding with 0xC0000108 breaks RX DMA on newer kernels. */
 
     /* Enable state machine */
     pio_sm_set_enabled(pio, sm0, true);
 
     /* Launch 2 concurrent DMA threads */
-    xfer_args_t tx_args = {pio, sm0, PIO_DIR_TO_SM,   data_bytes, tx_buf, 0};
-    xfer_args_t rx_args = {pio, sm0, PIO_DIR_FROM_SM,  data_bytes, rx_buf, 0};
+    xfer_args_t tx_args = {pio, sm0, PIO_DIR_TO_SM,   dma_bytes, tx_buf, 0, 0};
+    xfer_args_t rx_args = {pio, sm0, PIO_DIR_FROM_SM, dma_bytes, rx_buf, 0, 0};
 
     pthread_t t_tx, t_rx;
     pthread_create(&t_tx, NULL, xfer_thread, &tx_args);
@@ -292,8 +316,11 @@ static int loopback_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
 
     /* Check for DMA errors */
     if (tx_args.ret < 0 || rx_args.ret < 0) {
-        fprintf(stderr, "rp1_jtag: loopback DMA failed (tx=%d, rx=%d)\n",
-                tx_args.ret, rx_args.ret);
+        fprintf(stderr, "rp1_jtag: loopback DMA failed "
+                "(tx=%d[%s], rx=%d[%s], size=%zu)\n",
+                tx_args.ret, strerror(tx_args.err),
+                rx_args.ret, strerror(rx_args.err),
+                data_bytes);
         ret = RP1_JTAG_ERR_IO;
         goto cleanup;
     }
