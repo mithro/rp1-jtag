@@ -158,6 +158,34 @@ static int mock_xfer_data(pio_backend_t *be, int dir,
     return 0;
 }
 
+static int mock_xfer_data_bidi(pio_backend_t *be,
+                               uint32_t tx_bytes, const void *tx_data,
+                               uint32_t rx_bytes, void *rx_data)
+{
+    mock_backend_t *m = (mock_backend_t *)be;
+
+    /* TX: store data */
+    uint32_t tx_words = tx_bytes / 4;
+    const uint32_t *tx = (const uint32_t *)tx_data;
+    for (uint32_t i = 0; i < tx_words && m->tx_count < MOCK_FIFO_SIZE; i++) {
+        m->tx_data[m->tx_count++] = tx[i];
+        m->put_count++;
+    }
+
+    /* RX: return pre-loaded TDO data */
+    uint32_t rx_words = rx_bytes / 4;
+    uint32_t *rx = (uint32_t *)rx_data;
+    for (uint32_t i = 0; i < rx_words; i++) {
+        if (m->rx_read_pos < m->rx_count)
+            rx[i] = m->rx_data[m->rx_read_pos++];
+        else
+            rx[i] = 0;
+        m->get_count++;
+    }
+
+    return 0;
+}
+
 static const pio_backend_ops_t mock_ops = {
     .init             = mock_init,
     .close            = mock_close,
@@ -171,6 +199,7 @@ static const pio_backend_ops_t mock_ops = {
     .load_program     = mock_load_program,
     .config_xfer      = mock_config_xfer,
     .xfer_data        = mock_xfer_data,
+    .xfer_data_bidi   = mock_xfer_data_bidi,
 };
 
 pio_backend_t *pio_backend_mock_create(void)

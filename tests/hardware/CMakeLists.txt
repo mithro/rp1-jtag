@@ -29,7 +29,8 @@ if(HAVE_PIOLIB)
         ${PIOLIB_INCLUDE_DIR}
         ${CMAKE_SOURCE_DIR}/lib/src
     )
-    target_link_libraries(test_dma_explore ${PIOLIB_LIBRARY})
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_dma_explore ${PIOLIB_LIBRARY} Threads::Threads)
 endif()
 
 # Hardware tests are NOT added to CTest (they need real hardware).

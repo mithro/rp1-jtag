@@ -32,9 +32,10 @@ foreach(_tgt rp1jtag rp1jtag_static)
     )
 
     if(HAVE_PIOLIB)
+        find_package(Threads REQUIRED)
         target_compile_definitions(${_tgt} PRIVATE HAVE_PIOLIB)
         target_include_directories(${_tgt} PRIVATE ${PIOLIB_INCLUDE_DIR})
-        target_link_libraries(${_tgt} PRIVATE ${PIOLIB_LIBRARY})
+        target_link_libraries(${_tgt} PRIVATE ${PIOLIB_LIBRARY} Threads::Threads)
     endif()
 endforeach()
 

@@ -13,8 +13,11 @@
 /* PIO clock frequency (RP1 PIO runs at 200 MHz) */
 #define RP1_PIO_CLK_HZ  200000000
 
-/* Default JTAG clock frequency */
-#define DEFAULT_FREQ_HZ  6000000  /* 6 MHz */
+/* Default JTAG clock frequency.
+ * 10 MHz with jtag_shift_fast (2 instr/bit): divider = 200M / (10M * 2) = 10,
+ * giving 50 ns TDI setup time — well above Artix-7's 5 ns minimum.
+ * openFPGALoader's --freq flag overrides this default. */
+#define DEFAULT_FREQ_HZ  10000000  /* 10 MHz */
 
 /* Maximum valid BCM GPIO number on RPi 5 header */
 #define MAX_GPIO_PIN  27
