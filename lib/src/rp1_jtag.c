@@ -1,25 +1,30 @@
 /*
- * rp1_jtag.c - Core library implementation
+ * rp1_jtag.c - Core library implementation (Phase 2 DMA)
  *
- * TMS run-length splitting + word-by-word FIFO interleaving.
+ * Two-SM architecture with bulk DMA via three concurrent pthreads:
+ *   SM0: TDI/TDO/TCK (jtag_shift program, 4 instr/bit counted loop)
+ *   SM1: TMS (jtag_tms program, synchronized to SM0's TCK via GPIO wait)
+ *   Thread 1: SM0 TX DMA (count word + TDI data)
+ *   Thread 2: SM0 RX DMA (TDO data)
+ *   Thread 3: SM1 TX DMA (TMS data)
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#define _GNU_SOURCE
+
 #include "rp1_jtag_internal.h"
+#include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
-/* Maximum number of TMS runs we support per shift call.
- * In practice, openFPGALoader generates 2-3 runs per call. */
-#define MAX_TMS_RUNS 256
-
-/* Maximum words per PIO transfer (TX FIFO data words, excluding count).
- * Each chunk uses two stack arrays of this size (tdi_words + tdo_words),
- * so 8192 words = 32 KB per array = 64 KB total stack usage per chunk.
- * RPi 5 default stack limit is 8 MB, so this is well within bounds. */
-#define MAX_TRANSFER_WORDS 8192
+#ifdef HAVE_PIOLIB
+#include "piolib.h"
+#include "pio/generated/jtag_shift.pio.h"
+#include "pio/generated/jtag_tms.pio.h"
+#include "pio/generated/jtag_loopback.pio.h"
+#endif
 
 /* ---- Bit vector utilities ---- */
 
@@ -36,55 +41,23 @@ static inline void bit_set(uint8_t *vec, uint32_t bit, bool value)
         vec[bit / 8] &= ~(1u << (bit % 8));
 }
 
-/* ---- TMS run-length scanning ---- */
-
-int tms_scan_runs(const uint8_t *tms, uint32_t num_bits,
-                  tms_run_t *runs, int max_runs)
+/*
+ * Pack bits from a bit vector into 32-bit words, LSB-first.
+ *
+ * src:       Source bit vector, LSB-first
+ * start_bit: First bit to extract
+ * num_bits:  Number of bits to extract
+ * words:     Output array of 32-bit words (caller allocates)
+ */
+static void bits_to_words(const uint8_t *src, uint32_t start_bit,
+                           uint32_t num_bits, uint32_t *words)
 {
     if (num_bits == 0)
-        return 0;
+        return;
 
-    int count = 0;
-    uint32_t run_start = 0;
-    bool run_value = bit_get(tms, 0);
+    uint32_t num_words = bits_to_word_count(num_bits);
 
-    for (uint32_t i = 1; i < num_bits; i++) {
-        bool v = bit_get(tms, i);
-        if (v != run_value) {
-            /* End of current run */
-            if (count >= max_runs)
-                return -1;
-            runs[count].start_bit = run_start;
-            runs[count].num_bits = i - run_start;
-            runs[count].tms_value = run_value;
-            count++;
-            run_start = i;
-            run_value = v;
-        }
-    }
-
-    /* Final run */
-    if (count >= max_runs)
-        return -1;
-    runs[count].start_bit = run_start;
-    runs[count].num_bits = num_bits - run_start;
-    runs[count].tms_value = run_value;
-    count++;
-
-    return count;
-}
-
-/* ---- Bit-to-word packing ---- */
-
-int bits_to_words(const uint8_t *src, uint32_t start_bit,
-                  uint32_t num_bits, uint32_t *words)
-{
-    if (num_bits == 0)
-        return 0;
-
-    int num_words = (num_bits + BITS_PER_WORD - 1) / BITS_PER_WORD;
-
-    for (int w = 0; w < num_words; w++) {
+    for (uint32_t w = 0; w < num_words; w++) {
         uint32_t word = 0;
         uint32_t bits_this_word = num_bits - w * BITS_PER_WORD;
         if (bits_this_word > BITS_PER_WORD)
@@ -96,15 +69,22 @@ int bits_to_words(const uint8_t *src, uint32_t start_bit,
         }
         words[w] = word;
     }
-
-    return num_words;
 }
 
-void words_to_bits(const uint32_t *words, int num_words,
-                   uint8_t *dst, uint32_t start_bit,
-                   uint32_t num_bits)
+/*
+ * Unpack 32-bit words back into a bit vector sub-range, LSB-first.
+ *
+ * words:     Input array of 32-bit words from RX FIFO
+ * num_words: Number of words
+ * dst:       Destination bit vector, LSB-first
+ * start_bit: First bit position in dst to write
+ * num_bits:  Number of bits to unpack
+ */
+static void words_to_bits(const uint32_t *words, uint32_t num_words,
+                           uint8_t *dst, uint32_t start_bit,
+                           uint32_t num_bits)
 {
-    for (int w = 0; w < num_words; w++) {
+    for (uint32_t w = 0; w < num_words; w++) {
         uint32_t word = words[w];
         uint32_t bits_this_word = num_bits - w * BITS_PER_WORD;
         if (bits_this_word > BITS_PER_WORD)
@@ -117,74 +97,108 @@ void words_to_bits(const uint32_t *words, int num_words,
     }
 }
 
-/* ---- PIO shift for a single chunk ---- */
+/* ---- DMA thread wrapper ---- */
 
-/* Maximum bits per PIO transfer chunk */
-#define MAX_CHUNK_BITS (MAX_TRANSFER_WORDS * BITS_PER_WORD)
+#ifdef HAVE_PIOLIB
 
-static int pio_shift_chunk(rp1_jtag_t *jtag,
-                           const uint8_t *tdi, uint8_t *tdo,
-                           uint32_t start_bit, uint32_t num_bits)
+typedef struct {
+    PIO pio;
+    uint sm;
+    enum pio_xfer_dir dir;
+    size_t size;
+    void *buf;
+    int ret;
+} xfer_args_t;
+
+static void *xfer_thread(void *arg)
 {
-    pio_backend_t *be = jtag->backend;
-    int rc;
+    xfer_args_t *a = (xfer_args_t *)arg;
+    a->ret = pio_sm_xfer_data(a->pio, a->sm, a->dir, a->size, a->buf);
+    return NULL;
+}
 
-    /* Pack TDI bits into words */
-    int num_data_words = (num_bits + BITS_PER_WORD - 1) / BITS_PER_WORD;
-    uint32_t tdi_words[MAX_TRANSFER_WORDS];
-    bits_to_words(tdi, start_bit, num_bits, tdi_words);
+/* ---- Core JTAG shift via DMA (two SMs) ---- */
 
-    /* Write count word to TX FIFO */
-    rc = be->ops->sm_put(be, num_bits - 1);
-    if (rc < 0)
+/*
+ * Shift num_bits through JTAG using DMA with SM0 (TDI/TDO/TCK) and
+ * SM1 (TMS). Three concurrent pthreads handle:
+ *   - SM0 TX: count word + TDI data
+ *   - SM0 RX: TDO data
+ *   - SM1 TX: TMS data
+ */
+static int jtag_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
+                           const uint8_t *tms, const uint8_t *tdi,
+                           uint8_t *tdo)
+{
+    PIO pio = (PIO)jtag->pio;
+    uint sm0 = (uint)jtag->sm0;
+    uint sm1 = (uint)jtag->sm1;
+    int ret = 0;
+
+    /* Calculate buffer sizes */
+    uint32_t num_data_words = bits_to_word_count(num_bits);
+    size_t sm0_tx_bytes = (1 + num_data_words) * sizeof(uint32_t);  /* count + TDI */
+    size_t sm0_rx_bytes = num_data_words * sizeof(uint32_t);        /* TDO */
+    size_t sm1_tx_bytes = num_data_words * sizeof(uint32_t);        /* TMS */
+
+    /* Allocate aligned buffers for DMA */
+    uint32_t *sm0_tx = (uint32_t *)aligned_alloc(64, sm0_tx_bytes);
+    uint32_t *sm0_rx = (uint32_t *)aligned_alloc(64, sm0_rx_bytes);
+    uint32_t *sm1_tx = (uint32_t *)aligned_alloc(64, sm1_tx_bytes);
+    if (!sm0_tx || !sm0_rx || !sm1_tx) {
+        free(sm0_tx);
+        free(sm0_rx);
+        free(sm1_tx);
         return RP1_JTAG_ERR_IO;
-
-    /* Word-by-word FIFO interleaving:
-     *   - Write TDI words to TX FIFO
-     *   - Read TDO words from RX FIFO as they become available
-     * The PIO SM processes 32 bits per word, so we alternate
-     * between feeding TX and draining RX to avoid FIFO overflow. */
-    uint32_t tdo_words[MAX_TRANSFER_WORDS];
-    int tx_idx = 0;
-    int rx_idx = 0;
-
-    while (rx_idx < num_data_words) {
-        /* Feed TX FIFO */
-        while (tx_idx < num_data_words &&
-               be->ops->tx_fifo_has_space(be)) {
-            rc = be->ops->sm_put(be, tdi_words[tx_idx]);
-            if (rc < 0)
-                return RP1_JTAG_ERR_IO;
-            tx_idx++;
-        }
-
-        /* Drain RX FIFO */
-        while (rx_idx < num_data_words &&
-               be->ops->rx_fifo_has_data(be)) {
-            rc = be->ops->sm_get(be, &tdo_words[rx_idx]);
-            if (rc < 0)
-                return RP1_JTAG_ERR_IO;
-            rx_idx++;
-        }
-
-        /* If neither FIFO is ready, try blocking read to make progress */
-        if (rx_idx < num_data_words && tx_idx >= num_data_words) {
-            rc = be->ops->sm_get(be, &tdo_words[rx_idx]);
-            if (rc < 0)
-                return RP1_JTAG_ERR_IO;
-            rx_idx++;
-        }
     }
 
-    /* Drain spurious words from RX FIFO.
-     * RP1 PIO (v1) fires autopush before `push` instructions. For transfers
-     * that are exact multiples of 32 bits, autopush sends the real data word,
-     * then the explicit `push` sends a zeroed ISR as a spurious extra word.
-     * We must discard these to prevent them accumulating across transfers. */
-    {
-        uint32_t discard;
-        while (be->ops->rx_fifo_has_data(be))
-            be->ops->sm_get(be, &discard);
+    /* Pack data into word buffers */
+    sm0_tx[0] = num_bits - 1;                        /* count word */
+    bits_to_words(tdi, 0, num_bits, &sm0_tx[1]);     /* TDI data */
+    bits_to_words(tms, 0, num_bits, sm1_tx);         /* TMS data */
+    memset(sm0_rx, 0, sm0_rx_bytes);                 /* clear RX buffer */
+
+    /* Configure DMA channels */
+    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, sm0_tx_bytes, 1);
+    if (ret < 0) goto cleanup;
+    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM, sm0_rx_bytes, 1);
+    if (ret < 0) goto cleanup;
+    ret = pio_sm_config_xfer(pio, sm1, PIO_DIR_TO_SM, sm1_tx_bytes, 1);
+    if (ret < 0) goto cleanup;
+
+    /* Set FIFO thresholds for heavy DMA channel burst size */
+    pio_sm_set_dmactrl(pio, sm0, true,  DMA_FIFO_THRESHOLD);  /* SM0 TX */
+    pio_sm_set_dmactrl(pio, sm0, false, DMA_FIFO_THRESHOLD);  /* SM0 RX */
+    pio_sm_set_dmactrl(pio, sm1, true,  DMA_FIFO_THRESHOLD);  /* SM1 TX */
+
+    /* Enable both state machines */
+    pio_sm_set_enabled(pio, sm0, true);
+    pio_sm_set_enabled(pio, sm1, true);
+
+    /* Launch 3 concurrent DMA threads */
+    xfer_args_t tx0 = {pio, sm0, PIO_DIR_TO_SM,   sm0_tx_bytes, sm0_tx, 0};
+    xfer_args_t rx0 = {pio, sm0, PIO_DIR_FROM_SM,  sm0_rx_bytes, sm0_rx, 0};
+    xfer_args_t tx1 = {pio, sm1, PIO_DIR_TO_SM,    sm1_tx_bytes, sm1_tx, 0};
+
+    pthread_t t_tx0, t_rx0, t_tx1;
+    pthread_create(&t_tx0, NULL, xfer_thread, &tx0);
+    pthread_create(&t_rx0, NULL, xfer_thread, &rx0);
+    pthread_create(&t_tx1, NULL, xfer_thread, &tx1);
+
+    pthread_join(t_tx0, NULL);
+    pthread_join(t_rx0, NULL);
+    pthread_join(t_tx1, NULL);
+
+    /* Disable both state machines */
+    pio_sm_set_enabled(pio, sm1, false);
+    pio_sm_set_enabled(pio, sm0, false);
+
+    /* Check for DMA errors */
+    if (tx0.ret < 0 || rx0.ret < 0 || tx1.ret < 0) {
+        fprintf(stderr, "rp1_jtag: DMA transfer failed (tx0=%d, rx0=%d, tx1=%d)\n",
+                tx0.ret, rx0.ret, tx1.ret);
+        ret = RP1_JTAG_ERR_IO;
+        goto cleanup;
     }
 
     /* Fix partial-word alignment from PIO right-shift ISR.
@@ -195,362 +209,106 @@ static int pio_shift_chunk(rp1_jtag_t *jtag,
      * autopush are correctly aligned, but the last partial word from
      * the explicit `push` instruction needs right-shifting. */
     {
-        uint32_t partial_bits = num_bits % BITS_PER_WORD;
-        if (partial_bits != 0)
-            tdo_words[num_data_words - 1] >>= (BITS_PER_WORD - partial_bits);
+        uint32_t remainder = num_bits % BITS_PER_WORD;
+        if (remainder != 0) {
+            sm0_rx[num_data_words - 1] >>= (BITS_PER_WORD - remainder);
+        }
     }
 
     /* Unpack TDO words into output bit vector */
     if (tdo) {
-        words_to_bits(tdo_words, num_data_words, tdo, start_bit, num_bits);
+        words_to_bits(sm0_rx, num_data_words, tdo, 0, num_bits);
     }
 
-    return 0;
+    ret = 0;
+
+cleanup:
+    free(sm0_tx);
+    free(sm0_rx);
+    free(sm1_tx);
+    return ret;
 }
 
-/* ---- Program switching ---- */
+/* ---- Loopback shift via DMA (single SM, no TMS) ---- */
 
 /*
- * Minimum bits to justify switching to the fast program.
- * Must amortize program-switch overhead (~50us on RP1 PIOLib).
- * 256 bits = 8 words = 1 PIO transfer's worth of data.
+ * Shift num_bits through internal PIO loopback using DMA with SM0 only.
+ * The loopback program copies OSR -> ISR word-by-word, no count word.
+ * Two concurrent pthreads handle TX and RX.
  */
-#define FAST_PROGRAM_THRESHOLD  256
-
-/*
- * Switch to a different PIO program and update the clock divider.
- * Disables the SM before switching, does NOT re-enable (caller decides).
- */
-static int switch_program(rp1_jtag_t *jtag, pio_program_id_t prog,
-                          int new_instr_per_bit)
+static int loopback_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
+                               const uint8_t *tdi, uint8_t *tdo)
 {
-    pio_backend_t *be = jtag->backend;
-    int rc;
+    PIO pio = (PIO)jtag->pio;
+    uint sm0 = (uint)jtag->sm0;
+    int ret = 0;
 
-    if (jtag->current_program == prog)
-        return 0;
+    /* Calculate buffer sizes (no count word for loopback) */
+    uint32_t num_data_words = bits_to_word_count(num_bits);
+    size_t data_bytes = num_data_words * sizeof(uint32_t);
 
-    be->ops->sm_set_enabled(be, false);
-
-    rc = be->ops->load_program(be, prog);
-    if (rc < 0)
+    /* Allocate aligned buffers for DMA */
+    uint32_t *tx_buf = (uint32_t *)aligned_alloc(64, data_bytes);
+    uint32_t *rx_buf = (uint32_t *)aligned_alloc(64, data_bytes);
+    if (!tx_buf || !rx_buf) {
+        free(tx_buf);
+        free(rx_buf);
         return RP1_JTAG_ERR_IO;
+    }
 
-    jtag->current_program = prog;
-    jtag->instr_per_bit = new_instr_per_bit;
+    /* Pack TDI data into word buffer */
+    bits_to_words(tdi, 0, num_bits, tx_buf);
+    memset(rx_buf, 0, data_bytes);
 
-    /* Update divider for new program's instructions-per-bit */
-    float div = (float)RP1_PIO_CLK_HZ /
-                (jtag->freq_hz * jtag->instr_per_bit);
-    if (div < 1.0f)
-        div = 1.0f;
-    be->ops->set_clk_div(be, div);
+    /* Configure DMA channels */
+    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, data_bytes, 1);
+    if (ret < 0) goto cleanup;
+    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM, data_bytes, 1);
+    if (ret < 0) goto cleanup;
 
-    return 0;
+    /* Set FIFO thresholds */
+    pio_sm_set_dmactrl(pio, sm0, true,  DMA_FIFO_THRESHOLD);  /* TX */
+    pio_sm_set_dmactrl(pio, sm0, false, DMA_FIFO_THRESHOLD);  /* RX */
+
+    /* Enable state machine */
+    pio_sm_set_enabled(pio, sm0, true);
+
+    /* Launch 2 concurrent DMA threads */
+    xfer_args_t tx_args = {pio, sm0, PIO_DIR_TO_SM,   data_bytes, tx_buf, 0};
+    xfer_args_t rx_args = {pio, sm0, PIO_DIR_FROM_SM,  data_bytes, rx_buf, 0};
+
+    pthread_t t_tx, t_rx;
+    pthread_create(&t_tx, NULL, xfer_thread, &tx_args);
+    pthread_create(&t_rx, NULL, xfer_thread, &rx_args);
+
+    pthread_join(t_tx, NULL);
+    pthread_join(t_rx, NULL);
+
+    /* Disable state machine */
+    pio_sm_set_enabled(pio, sm0, false);
+
+    /* Check for DMA errors */
+    if (tx_args.ret < 0 || rx_args.ret < 0) {
+        fprintf(stderr, "rp1_jtag: loopback DMA failed (tx=%d, rx=%d)\n",
+                tx_args.ret, rx_args.ret);
+        ret = RP1_JTAG_ERR_IO;
+        goto cleanup;
+    }
+
+    /* Unpack TDO words into output bit vector */
+    if (tdo) {
+        words_to_bits(rx_buf, num_data_words, tdo, 0, num_bits);
+    }
+
+    ret = 0;
+
+cleanup:
+    free(tx_buf);
+    free(rx_buf);
+    return ret;
 }
 
-/* ---- Fast PIO shift (no count word, SM managed by caller) ---- */
-
-/*
- * DMA ping-pong chunk size: 8 words = 32 bytes (matches RP1 FIFO depth).
- * Larger DMA transfers deadlock because the blocking TX DMA fills the
- * TX FIFO but nobody drains the RX FIFO, stalling the SM.
- *
- * Note: config_xfer buf_size must also be 32 bytes. Larger values
- * (e.g. 32768) cause PIOLib DMA timeouts even though the actual
- * xfer_data calls only transfer 32 bytes each.
- */
-#define DMA_CHUNK_WORDS  8
-#define DMA_CHUNK_BYTES  (DMA_CHUNK_WORDS * 4)
-
-/*
- * Ensure DMA channels are configured (once, lazily).
- */
-static int ensure_dma_configured(rp1_jtag_t *jtag)
-{
-    pio_backend_t *be = jtag->backend;
-    int rc;
-
-    if (jtag->dma_configured)
-        return 0;
-
-    if (!be->ops->config_xfer)
-        return -1;
-
-    rc = be->ops->config_xfer(be, PIO_BE_DIR_TX, DMA_CHUNK_BYTES, 1);
-    if (rc < 0)
-        return rc;
-
-    rc = be->ops->config_xfer(be, PIO_BE_DIR_RX, DMA_CHUNK_BYTES, 1);
-    if (rc < 0)
-        return rc;
-
-    jtag->dma_configured = true;
-    return 0;
-}
-
-/*
- * Shift one chunk using jtag_shift_fast (2 instr/bit, no count word).
- * Only handles exact multiples of 32 bits.
- *
- * Caller must enable the SM before the first call and disable it after
- * the last call. Between calls, the SM stalls safely with TCK low
- * (the `out pins, 1 side 0` instruction stalls on autopull).
- *
- * Three-tier DMA strategy:
- *  1. xfer_data_bidi: threaded concurrent TX+RX (entire chunk, ~2 ioctls)
- *  2. xfer_data ping-pong: TX 32B → RX 32B → repeat (~N/4 ioctls)
- *  3. word-by-word FIFO interleaving (no DMA)
- */
-static int pio_shift_fast_chunk(rp1_jtag_t *jtag,
-                                const uint8_t *tdi, uint8_t *tdo,
-                                uint32_t start_bit, uint32_t num_bits)
-{
-    pio_backend_t *be = jtag->backend;
-    int rc;
-
-    /* num_bits must be a multiple of 32 */
-    int num_words = num_bits / BITS_PER_WORD;
-    uint32_t tdi_words[MAX_TRANSFER_WORDS];
-    bits_to_words(tdi, start_bit, num_bits, tdi_words);
-
-    uint32_t tdo_words[MAX_TRANSFER_WORDS];
-
-    /* Try threaded bidi DMA first (entire chunk in one call) */
-    if (be->ops->xfer_data_bidi && ensure_dma_configured(jtag) == 0) {
-        int data_bytes = num_words * 4;
-        rc = be->ops->xfer_data_bidi(be, data_bytes, tdi_words,
-                                          data_bytes, tdo_words);
-        if (rc < 0)
-            return RP1_JTAG_ERR_IO;
-    } else if (be->ops->xfer_data && ensure_dma_configured(jtag) == 0) {
-        /*
-         * Fallback: DMA ping-pong (TX 32 bytes, RX 32 bytes, repeat).
-         * Each DMA call transfers 8 words (FIFO depth). This reduces
-         * the ioctl count from 2N (word-by-word) to N/4 (DMA chunks).
-         */
-        int word_idx = 0;
-        while (word_idx < num_words) {
-            int chunk_words = num_words - word_idx;
-            if (chunk_words > DMA_CHUNK_WORDS)
-                chunk_words = DMA_CHUNK_WORDS;
-            int chunk_bytes = chunk_words * 4;
-
-            rc = be->ops->xfer_data(be, PIO_BE_DIR_TX,
-                                    chunk_bytes, &tdi_words[word_idx]);
-            if (rc < 0)
-                return RP1_JTAG_ERR_IO;
-
-            rc = be->ops->xfer_data(be, PIO_BE_DIR_RX,
-                                    chunk_bytes, &tdo_words[word_idx]);
-            if (rc < 0)
-                return RP1_JTAG_ERR_IO;
-
-            word_idx += chunk_words;
-        }
-    } else {
-        /* Fallback: word-by-word FIFO interleaving */
-        int tx_idx = 0;
-        int rx_idx = 0;
-
-        while (rx_idx < num_words) {
-            while (tx_idx < num_words &&
-                   be->ops->tx_fifo_has_space(be)) {
-                rc = be->ops->sm_put(be, tdi_words[tx_idx]);
-                if (rc < 0)
-                    return RP1_JTAG_ERR_IO;
-                tx_idx++;
-            }
-
-            while (rx_idx < num_words &&
-                   be->ops->rx_fifo_has_data(be)) {
-                rc = be->ops->sm_get(be, &tdo_words[rx_idx]);
-                if (rc < 0)
-                    return RP1_JTAG_ERR_IO;
-                rx_idx++;
-            }
-
-            if (rx_idx < num_words && tx_idx >= num_words) {
-                rc = be->ops->sm_get(be, &tdo_words[rx_idx]);
-                if (rc < 0)
-                    return RP1_JTAG_ERR_IO;
-                rx_idx++;
-            }
-        }
-    }
-
-    /* Unpack TDO (no partial-word fixup needed — all words are full 32-bit) */
-    if (tdo)
-        words_to_bits(tdo_words, num_words, tdo, start_bit, num_bits);
-
-    return 0;
-}
-
-/* ---- PIO shift for a single TMS run ---- */
-
-int pio_shift_run(rp1_jtag_t *jtag, bool tms_value,
-                  const uint8_t *tdi, uint8_t *tdo,
-                  uint32_t start_bit, uint32_t num_bits)
-{
-    int rc;
-
-    if (num_bits == 0)
-        return 0;
-
-    /* Set TMS via GPIO (only in JTAG mode, not loopback) */
-    if (jtag->mode == MODE_JTAG && jtag->pins.tms >= 0) {
-        rc = jtag->backend->ops->gpio_set(jtag->backend,
-                                           jtag->pins.tms, tms_value);
-        if (rc < 0)
-            return RP1_JTAG_ERR_IO;
-    }
-
-    uint32_t bit_offset = start_bit;
-    uint32_t remaining = num_bits;
-
-    /*
-     * Fast path: use jtag_shift_fast for bulk data (≥256 bits, JTAG mode).
-     * The fast program is 2 instructions/bit (vs 5), but only handles
-     * exact multiples of 32 bits. Remainder goes through counted program.
-     *
-     * Not used in loopback mode (fast program uses real pins, loopback
-     * program uses internal y-register copy).
-     */
-    if (remaining >= FAST_PROGRAM_THRESHOLD && jtag->mode == MODE_JTAG) {
-        uint32_t fast_bits = (remaining / BITS_PER_WORD) * BITS_PER_WORD;
-        uint32_t remainder_bits = remaining - fast_bits;
-
-        /* Switch to fast program (disables SM) */
-        rc = switch_program(jtag, PIO_PROG_JTAG_SHIFT_FAST,
-                            INSTR_PER_BIT_FAST);
-        if (rc < 0)
-            return rc;
-
-        /* Enable SM once — fast program stalls safely on autopull
-         * when TX FIFO empties, holding TCK low between chunks. */
-        jtag->backend->ops->sm_set_enabled(jtag->backend, true);
-
-        /* Process in MAX_CHUNK_BITS-sized pieces */
-        while (fast_bits > 0) {
-            uint32_t chunk_bits = fast_bits;
-            if (chunk_bits > MAX_CHUNK_BITS)
-                chunk_bits = MAX_CHUNK_BITS;
-
-            rc = pio_shift_fast_chunk(jtag, tdi, tdo,
-                                      bit_offset, chunk_bits);
-            if (rc < 0)
-                break;
-
-            bit_offset += chunk_bits;
-            fast_bits -= chunk_bits;
-        }
-
-        /* Stop sequence (once): disable SM, force TCK low, drain FIFO */
-        {
-            pio_backend_t *be = jtag->backend;
-            be->ops->sm_set_enabled(be, false);
-            if (jtag->mode == MODE_JTAG && jtag->pins.tck >= 0)
-                be->ops->gpio_set(be, jtag->pins.tck, false);
-            uint32_t discard;
-            while (be->ops->rx_fifo_has_data(be))
-                be->ops->sm_get(be, &discard);
-        }
-
-        if (rc < 0)
-            return rc;
-
-        remaining = remainder_bits;
-
-        if (remaining > 0) {
-            /* Switch back to counted program for remainder */
-            rc = switch_program(jtag, PIO_PROG_JTAG_SHIFT,
-                                INSTR_PER_BIT_COUNTED);
-            if (rc < 0)
-                return rc;
-            jtag->backend->ops->sm_set_enabled(jtag->backend, true);
-        }
-    }
-
-    /*
-     * Counted path: use jtag_shift for remaining bits (or all bits
-     * if below threshold). Handles any bit count including partial words.
-     */
-    if (remaining > 0) {
-        /* Ensure counted program is loaded and SM is running */
-        if (jtag->current_program != PIO_PROG_JTAG_SHIFT &&
-            jtag->current_program != PIO_PROG_JTAG_LOOPBACK) {
-            pio_program_id_t counted_prog =
-                (jtag->mode == MODE_LOOPBACK) ? PIO_PROG_JTAG_LOOPBACK
-                                               : PIO_PROG_JTAG_SHIFT;
-            rc = switch_program(jtag, counted_prog, INSTR_PER_BIT_COUNTED);
-            if (rc < 0)
-                return rc;
-            jtag->backend->ops->sm_set_enabled(jtag->backend, true);
-        }
-
-        while (remaining > 0) {
-            uint32_t chunk_bits = remaining;
-            if (chunk_bits > MAX_CHUNK_BITS)
-                chunk_bits = MAX_CHUNK_BITS;
-
-            rc = pio_shift_chunk(jtag, tdi, tdo, bit_offset, chunk_bits);
-            if (rc < 0)
-                return rc;
-
-            bit_offset += chunk_bits;
-            remaining -= chunk_bits;
-        }
-    }
-
-    return 0;
-}
-
-/* ---- Public API ---- */
-
-static rp1_jtag_t *init_common(pio_backend_t *backend,
-                                const rp1_jtag_pins_t *pins,
-                                rp1_jtag_mode_t mode,
-                                pio_program_id_t prog)
-{
-    rp1_jtag_t *jtag = calloc(1, sizeof(rp1_jtag_t));
-    if (!jtag) {
-        pio_backend_destroy(backend);
-        return NULL;
-    }
-
-    jtag->backend = backend;
-    jtag->mode = mode;
-    jtag->freq_hz = DEFAULT_FREQ_HZ;
-    jtag->instr_per_bit = INSTR_PER_BIT_COUNTED;
-    jtag->current_program = prog;
-
-    if (pins)
-        jtag->pins = *pins;
-    else
-        memset(&jtag->pins, -1, sizeof(jtag->pins));
-
-    /* Configure PIO SM pins */
-    pio_sm_pins_t sm_pins = {
-        .sideset_base = pins ? pins->tck : -1,
-        .out_base     = pins ? pins->tdi : -1,
-        .in_base      = pins ? pins->tdo : -1,
-        .tms_base     = pins ? pins->tms : -1,
-        .clk_div      = (float)RP1_PIO_CLK_HZ /
-                         (jtag->freq_hz * jtag->instr_per_bit),
-    };
-
-    int rc = backend->ops->init(backend, prog, &sm_pins);
-    if (rc < 0) {
-        free(jtag);
-        pio_backend_destroy(backend);
-        return NULL;
-    }
-
-    /* Enable the state machine */
-    backend->ops->sm_set_enabled(backend, true);
-
-    return jtag;
-}
+/* ---- Public API (with PIOLib) ---- */
 
 rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
 {
@@ -564,27 +322,214 @@ rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
         pins->tdo < 0 || pins->tdo > MAX_GPIO_PIN)
         return NULL;
 
-    pio_backend_t *be = pio_backend_rp1_create();
-    if (!be)
+    /* Check for pin conflicts among required JTAG pins */
+    if (pins->tck == pins->tms || pins->tck == pins->tdi ||
+        pins->tck == pins->tdo || pins->tms == pins->tdi ||
+        pins->tms == pins->tdo || pins->tdi == pins->tdo)
         return NULL;
 
-    return init_common(be, pins, MODE_JTAG, PIO_PROG_JTAG_SHIFT);
+    /* Initialize PIO subsystem */
+    if (pio_init() < 0) {
+        fprintf(stderr, "rp1_jtag: pio_init() failed\n");
+        return NULL;
+    }
+
+    /* Open PIO0 instance */
+    PIO pio = pio_open(0);
+    if (PIO_IS_ERR(pio)) {
+        fprintf(stderr, "rp1_jtag: failed to open PIO0 "
+                "(is /dev/pio0 available?)\n");
+        return NULL;
+    }
+
+    /* Claim two state machines */
+    int sm0 = pio_claim_unused_sm(pio, true);
+    if (sm0 < 0) {
+        fprintf(stderr, "rp1_jtag: no free state machine for SM0\n");
+        pio_close(pio);
+        return NULL;
+    }
+
+    int sm1 = pio_claim_unused_sm(pio, true);
+    if (sm1 < 0) {
+        fprintf(stderr, "rp1_jtag: no free state machine for SM1\n");
+        pio_sm_unclaim(pio, (uint)sm0);
+        pio_close(pio);
+        return NULL;
+    }
+
+    /* Load PIO programs into instruction memory */
+    uint offset0 = pio_add_program(pio, &jtag_shift_program);
+    if (offset0 == PIO_ORIGIN_INVALID) {
+        fprintf(stderr, "rp1_jtag: failed to load jtag_shift program\n");
+        pio_sm_unclaim(pio, (uint)sm1);
+        pio_sm_unclaim(pio, (uint)sm0);
+        pio_close(pio);
+        return NULL;
+    }
+
+    uint offset1 = pio_add_program(pio, &jtag_tms_program);
+    if (offset1 == PIO_ORIGIN_INVALID) {
+        fprintf(stderr, "rp1_jtag: failed to load jtag_tms program\n");
+        pio_remove_program(pio, &jtag_shift_program, offset0);
+        pio_sm_unclaim(pio, (uint)sm1);
+        pio_sm_unclaim(pio, (uint)sm0);
+        pio_close(pio);
+        return NULL;
+    }
+
+    /* Select PIO instance for sm_config_set_* functions */
+    pio_select(pio);
+
+    /* Configure SM0: TDI/TDO/TCK (jtag_shift program) */
+    pio_sm_config c0 = jtag_shift_program_get_default_config(offset0);
+    sm_config_set_out_pins(&c0, pins->tdi, 1);
+    sm_config_set_in_pins(&c0, pins->tdo);
+    sm_config_set_sideset_pins(&c0, pins->tck);
+    sm_config_set_out_shift(&c0, true, true, 32);   /* right shift, autopull at 32 */
+    sm_config_set_in_shift(&c0, true, true, 32);     /* right shift, autopush at 32 */
+    float div0 = (float)RP1_PIO_CLK_HZ / ((float)DEFAULT_FREQ_HZ * INSTR_PER_BIT);
+    sm_config_set_clkdiv(&c0, div0);
+    pio_sm_init(pio, (uint)sm0, offset0, &c0);
+
+    /* Set pin directions for SM0 */
+    pio_gpio_init(pio, pins->tck);
+    pio_gpio_init(pio, pins->tdi);
+    pio_gpio_init(pio, pins->tdo);
+    pio_sm_set_consecutive_pindirs(pio, (uint)sm0, pins->tck, 1, true);   /* TCK output */
+    pio_sm_set_consecutive_pindirs(pio, (uint)sm0, pins->tdi, 1, true);   /* TDI output */
+    pio_sm_set_consecutive_pindirs(pio, (uint)sm0, pins->tdo, 1, false);  /* TDO input */
+
+    /* Configure SM1: TMS (jtag_tms program)
+     *
+     * LIMITATION: The jtag_tms program has GPIO4 hardcoded in its wait
+     * instructions (wait 0 gpio 4 / wait 1 gpio 4) to synchronize with
+     * SM0's TCK. If TCK is not on GPIO4, the wait instructions would need
+     * to be patched at runtime. For NeTV2 (TCK=GPIO4), this works as-is. */
+    pio_sm_config c1 = jtag_tms_program_get_default_config(offset1);
+    sm_config_set_out_pins(&c1, pins->tms, 1);
+    sm_config_set_out_shift(&c1, true, true, 32);   /* right shift, autopull at 32 */
+    sm_config_set_clkdiv(&c1, div0);                /* same clock as SM0 */
+    pio_sm_init(pio, (uint)sm1, offset1, &c1);
+
+    /* Set pin direction for SM1 */
+    pio_gpio_init(pio, pins->tms);
+    pio_sm_set_consecutive_pindirs(pio, (uint)sm1, pins->tms, 1, true);   /* TMS output */
+
+    /* Allocate and fill context */
+    rp1_jtag_t *jtag = calloc(1, sizeof(rp1_jtag_t));
+    if (!jtag) {
+        pio_remove_program(pio, &jtag_tms_program, offset1);
+        pio_remove_program(pio, &jtag_shift_program, offset0);
+        pio_sm_unclaim(pio, (uint)sm1);
+        pio_sm_unclaim(pio, (uint)sm0);
+        pio_close(pio);
+        return NULL;
+    }
+
+    jtag->pins = *pins;
+    jtag->mode = MODE_JTAG;
+    jtag->freq_hz = DEFAULT_FREQ_HZ;
+    jtag->pio = pio;
+    jtag->sm0 = sm0;
+    jtag->sm1 = sm1;
+    jtag->offset0 = offset0;
+    jtag->offset1 = offset1;
+
+    return jtag;
 }
 
 rp1_jtag_t *rp1_jtag_init_loopback(void)
 {
-    pio_backend_t *be = pio_backend_rp1_create();
-    if (!be)
+    /* Initialize PIO subsystem */
+    if (pio_init() < 0) {
+        fprintf(stderr, "rp1_jtag: pio_init() failed\n");
         return NULL;
+    }
 
-    return init_common(be, NULL, MODE_LOOPBACK, PIO_PROG_JTAG_LOOPBACK);
+    /* Open PIO0 instance */
+    PIO pio = pio_open(0);
+    if (PIO_IS_ERR(pio)) {
+        fprintf(stderr, "rp1_jtag: failed to open PIO0\n");
+        return NULL;
+    }
+
+    /* Claim one state machine (loopback only needs SM0) */
+    int sm0 = pio_claim_unused_sm(pio, true);
+    if (sm0 < 0) {
+        fprintf(stderr, "rp1_jtag: no free state machine\n");
+        pio_close(pio);
+        return NULL;
+    }
+
+    /* Load loopback program */
+    uint offset0 = pio_add_program(pio, &jtag_loopback_program);
+    if (offset0 == PIO_ORIGIN_INVALID) {
+        fprintf(stderr, "rp1_jtag: failed to load jtag_loopback program\n");
+        pio_sm_unclaim(pio, (uint)sm0);
+        pio_close(pio);
+        return NULL;
+    }
+
+    /* Select PIO instance for sm_config_set_* functions */
+    pio_select(pio);
+
+    /* Configure SM0 for loopback (no pins, word-at-a-time copy) */
+    pio_sm_config c0 = jtag_loopback_program_get_default_config(offset0);
+    sm_config_set_out_shift(&c0, true, true, 32);   /* right shift, autopull at 32 */
+    sm_config_set_in_shift(&c0, true, true, 32);     /* right shift, autopush at 32 */
+    sm_config_set_clkdiv(&c0, 1.0f);                /* full speed for loopback */
+    pio_sm_init(pio, (uint)sm0, offset0, &c0);
+
+    /* Allocate and fill context */
+    rp1_jtag_t *jtag = calloc(1, sizeof(rp1_jtag_t));
+    if (!jtag) {
+        pio_remove_program(pio, &jtag_loopback_program, offset0);
+        pio_sm_unclaim(pio, (uint)sm0);
+        pio_close(pio);
+        return NULL;
+    }
+
+    memset(&jtag->pins, -1, sizeof(jtag->pins));
+    jtag->mode = MODE_LOOPBACK;
+    jtag->freq_hz = DEFAULT_FREQ_HZ;
+    jtag->pio = pio;
+    jtag->sm0 = sm0;
+    jtag->sm1 = -1;      /* no TMS SM in loopback mode */
+    jtag->offset0 = offset0;
+    jtag->offset1 = 0;
+
+    return jtag;
 }
 
 void rp1_jtag_close(rp1_jtag_t *jtag)
 {
     if (!jtag)
         return;
-    pio_backend_destroy(jtag->backend);
+
+    PIO pio = (PIO)jtag->pio;
+
+    /* Disable state machines */
+    pio_sm_set_enabled(pio, (uint)jtag->sm0, false);
+    if (jtag->sm1 >= 0)
+        pio_sm_set_enabled(pio, (uint)jtag->sm1, false);
+
+    /* Remove programs from instruction memory */
+    if (jtag->mode == MODE_JTAG) {
+        pio_remove_program(pio, &jtag_tms_program, jtag->offset1);
+        pio_remove_program(pio, &jtag_shift_program, jtag->offset0);
+    } else {
+        pio_remove_program(pio, &jtag_loopback_program, jtag->offset0);
+    }
+
+    /* Release state machines */
+    if (jtag->sm1 >= 0)
+        pio_sm_unclaim(pio, (uint)jtag->sm1);
+    pio_sm_unclaim(pio, (uint)jtag->sm0);
+
+    /* Close PIO instance */
+    pio_close(pio);
+
     free(jtag);
 }
 
@@ -593,17 +538,19 @@ int rp1_jtag_set_freq(rp1_jtag_t *jtag, uint32_t freq_hz)
     if (!jtag || freq_hz == 0)
         return RP1_JTAG_ERR_PARAM;
 
-    /*
-     * Clock divider: TCK freq = PIO_CLK / (instr_per_bit * divider).
-     * jtag_shift uses 5 instr/bit, jtag_shift_fast uses 2 instr/bit.
-     */
-    float div = (float)RP1_PIO_CLK_HZ / (freq_hz * jtag->instr_per_bit);
+    PIO pio = (PIO)jtag->pio;
+
+    /* Clock divider: TCK freq = PIO_CLK / (INSTR_PER_BIT * divider) */
+    float div = (float)RP1_PIO_CLK_HZ / ((float)freq_hz * INSTR_PER_BIT);
     if (div < 1.0f)
         div = 1.0f;
 
-    int rc = jtag->backend->ops->set_clk_div(jtag->backend, div);
-    if (rc < 0)
-        return RP1_JTAG_ERR_IO;
+    /* Set divider on SM0 */
+    pio_sm_set_clkdiv(pio, (uint)jtag->sm0, div);
+
+    /* Set divider on SM1 if in JTAG mode (not loopback) */
+    if (jtag->sm1 >= 0)
+        pio_sm_set_clkdiv(pio, (uint)jtag->sm1, div);
 
     jtag->freq_hz = freq_hz;
     return 0;
@@ -620,28 +567,18 @@ int rp1_jtag_shift(rp1_jtag_t *jtag, uint32_t num_bits,
                    const uint8_t *tms, const uint8_t *tdi,
                    uint8_t *tdo)
 {
-    if (!jtag || !tms || !tdi)
+    if (!jtag || !tdi)
         return RP1_JTAG_ERR_PARAM;
     if (num_bits == 0)
         return 0;
 
-    /* Scan TMS vector into contiguous runs of constant value */
-    tms_run_t runs[MAX_TMS_RUNS];
-    int num_runs = tms_scan_runs(tms, num_bits, runs, MAX_TMS_RUNS);
-    if (num_runs < 0)
-        return RP1_JTAG_ERR_PARAM;
-
-    /* Execute each run as a separate PIO transfer */
-    for (int i = 0; i < num_runs; i++) {
-        int rc = pio_shift_run(jtag, runs[i].tms_value,
-                               tdi, tdo,
-                               runs[i].start_bit,
-                               runs[i].num_bits);
-        if (rc < 0)
-            return rc;
+    if (jtag->mode == MODE_JTAG) {
+        if (!tms)
+            return RP1_JTAG_ERR_PARAM;
+        return jtag_shift_dma(jtag, num_bits, tms, tdi, tdo);
+    } else {
+        return loopback_shift_dma(jtag, num_bits, tdi, tdo);
     }
-
-    return 0;
 }
 
 int rp1_jtag_toggle_clk(rp1_jtag_t *jtag, uint32_t num_clocks,
@@ -677,30 +614,75 @@ int rp1_jtag_reset(rp1_jtag_t *jtag, int srst, int trst)
     if (!jtag)
         return RP1_JTAG_ERR_PARAM;
 
-    pio_backend_t *be = jtag->backend;
-    int rc;
+    PIO pio = (PIO)jtag->pio;
 
+    /* Drive SRST pin if configured and requested */
     if (srst >= 0 && jtag->pins.srst >= 0) {
-        rc = be->ops->gpio_set(be, jtag->pins.srst, srst ? true : false);
-        if (rc < 0)
-            return RP1_JTAG_ERR_IO;
+        uint32_t mask = 1u << jtag->pins.srst;
+        uint32_t val = srst ? mask : 0;
+        pio_sm_set_pins_with_mask(pio, (uint)jtag->sm0, val, mask);
     }
 
+    /* Drive TRST pin if configured and requested */
     if (trst >= 0 && jtag->pins.trst >= 0) {
-        rc = be->ops->gpio_set(be, jtag->pins.trst, trst ? true : false);
-        if (rc < 0)
-            return RP1_JTAG_ERR_IO;
+        uint32_t mask = 1u << jtag->pins.trst;
+        uint32_t val = trst ? mask : 0;
+        pio_sm_set_pins_with_mask(pio, (uint)jtag->sm0, val, mask);
     }
 
     return 0;
 }
 
-/*
- * Internal: create a context with a specific backend (for unit tests).
- * The backend is not initialized -- caller must call init() on it.
- */
-rp1_jtag_t *rp1_jtag_init_with_backend(pio_backend_t *backend,
-                                        const rp1_jtag_pins_t *pins)
+#else /* !HAVE_PIOLIB */
+
+/* ---- Stub implementations when PIOLib is not available ---- */
+
+rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
 {
-    return init_common(backend, pins, MODE_JTAG, PIO_PROG_JTAG_SHIFT);
+    (void)pins;
+    fprintf(stderr, "rp1_jtag: compiled without PIOLib support\n");
+    return NULL;
 }
+
+rp1_jtag_t *rp1_jtag_init_loopback(void)
+{
+    fprintf(stderr, "rp1_jtag: compiled without PIOLib support\n");
+    return NULL;
+}
+
+void rp1_jtag_close(rp1_jtag_t *jtag) { (void)jtag; }
+
+int rp1_jtag_set_freq(rp1_jtag_t *jtag, uint32_t freq_hz)
+{
+    (void)jtag; (void)freq_hz;
+    return RP1_JTAG_ERR_NODEV;
+}
+
+uint32_t rp1_jtag_get_freq(rp1_jtag_t *jtag)
+{
+    (void)jtag;
+    return 0;
+}
+
+int rp1_jtag_shift(rp1_jtag_t *jtag, uint32_t num_bits,
+                   const uint8_t *tms, const uint8_t *tdi,
+                   uint8_t *tdo)
+{
+    (void)jtag; (void)num_bits; (void)tms; (void)tdi; (void)tdo;
+    return RP1_JTAG_ERR_NODEV;
+}
+
+int rp1_jtag_toggle_clk(rp1_jtag_t *jtag, uint32_t num_clocks,
+                        bool tms, bool tdi)
+{
+    (void)jtag; (void)num_clocks; (void)tms; (void)tdi;
+    return RP1_JTAG_ERR_NODEV;
+}
+
+int rp1_jtag_reset(rp1_jtag_t *jtag, int srst, int trst)
+{
+    (void)jtag; (void)srst; (void)trst;
+    return RP1_JTAG_ERR_NODEV;
+}
+
+#endif /* HAVE_PIOLIB */

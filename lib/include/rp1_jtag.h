@@ -1,6 +1,11 @@
 /*
  * rp1_jtag.h - Public API for RP1 PIO JTAG library
  *
+ * Phase 2 architecture: Two PIO state machines with bulk DMA.
+ *   SM0: TDI/TDO/TCK (jtag_shift program, 4 instr/bit counted loop)
+ *   SM1: TMS (jtag_tms program, synchronized to SM0's TCK via GPIO wait)
+ * Three concurrent pthreads handle DMA: SM0 TX, SM0 RX, SM1 TX.
+ *
  * SPDX-License-Identifier: Apache-2.0
  */
 
