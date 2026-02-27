@@ -57,4 +57,14 @@ static inline uint32_t bits_to_word_count(uint32_t num_bits) {
     return (num_bits + BITS_PER_WORD - 1) / BITS_PER_WORD;
 }
 
+/* Pack bits from a bit vector into 32-bit words, LSB-first.
+ * Returns the number of words written. */
+int bits_to_words(const uint8_t *src, uint32_t start_bit,
+                  uint32_t num_bits, uint32_t *words);
+
+/* Unpack 32-bit words back into a bit vector sub-range, LSB-first. */
+void words_to_bits(const uint32_t *words, uint32_t num_words,
+                   uint8_t *dst, uint32_t start_bit,
+                   uint32_t num_bits);
+
 #endif /* RP1_JTAG_INTERNAL_H */
