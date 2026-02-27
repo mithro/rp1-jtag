@@ -43,17 +43,18 @@ static inline void bit_set(uint8_t *vec, uint32_t bit, bool value)
 
 /*
  * Pack bits from a bit vector into 32-bit words, LSB-first.
+ * Returns the number of words written.
  *
  * src:       Source bit vector, LSB-first
  * start_bit: First bit to extract
  * num_bits:  Number of bits to extract
  * words:     Output array of 32-bit words (caller allocates)
  */
-static void bits_to_words(const uint8_t *src, uint32_t start_bit,
-                           uint32_t num_bits, uint32_t *words)
+int bits_to_words(const uint8_t *src, uint32_t start_bit,
+                  uint32_t num_bits, uint32_t *words)
 {
     if (num_bits == 0)
-        return;
+        return 0;
 
     uint32_t num_words = bits_to_word_count(num_bits);
 
@@ -69,6 +70,8 @@ static void bits_to_words(const uint8_t *src, uint32_t start_bit,
         }
         words[w] = word;
     }
+
+    return (int)num_words;
 }
 
 /*
@@ -80,9 +83,9 @@ static void bits_to_words(const uint8_t *src, uint32_t start_bit,
  * start_bit: First bit position in dst to write
  * num_bits:  Number of bits to unpack
  */
-static void words_to_bits(const uint32_t *words, uint32_t num_words,
-                           uint8_t *dst, uint32_t start_bit,
-                           uint32_t num_bits)
+void words_to_bits(const uint32_t *words, uint32_t num_words,
+                   uint8_t *dst, uint32_t start_bit,
+                   uint32_t num_bits)
 {
     for (uint32_t w = 0; w < num_words; w++) {
         uint32_t word = words[w];
