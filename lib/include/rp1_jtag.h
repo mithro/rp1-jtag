@@ -61,11 +61,11 @@ uint32_t rp1_jtag_get_freq(rp1_jtag_t *jtag);
  *   - TMS is driven before the rising edge of TCK
  *   - TDO is sampled after the falling edge of TCK (valid from target)
  *
- * Internally, the library scans the TMS vector and splits it into contiguous
- * runs of constant TMS value. Each run becomes one PIO transfer with TMS set
- * via GPIO. This means the common case (long runs of TMS=0 for DR/IR shifts)
- * uses fast PIO bulk transfer, while TMS transitions (short TAP navigation
- * sequences) are handled correctly but with per-run GPIO overhead (~10us/run).
+ * Internally, two PIO state machines run concurrently via DMA:
+ *   SM0 shifts TDI out and captures TDO, with TCK driven by sideset.
+ *   SM1 shifts TMS synchronized to SM0's TCK via GPIO wait instructions.
+ * Three pthreads handle the DMA transfers (SM0 TX, SM0 RX, SM1 TX),
+ * enabling bulk transfer of the entire bit vector in a single call.
  *
  * tms/tdi: input bit vectors, LSB-first, ceil(num_bits/8) bytes each
  * tdo:     output bit vector, may be NULL if TDO capture not needed
