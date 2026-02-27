@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #ifdef HAVE_PIOLIB
 #include "piolib.h"
@@ -194,19 +195,35 @@ static int jtag_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
     pio_sm_set_enabled(pio, sm0, true);
     pio_sm_set_enabled(pio, sm1, true);
 
-    /* Launch 3 concurrent DMA threads */
+    /* Launch 3 concurrent DMA threads.
+     *
+     * ORDERING: SM1 TX (TMS) MUST start before SM0 TX (TDI/TCK).
+     *
+     * At this point both SMs are enabled but stalled:
+     *   SM0: stalled on `pull side 0` (TX FIFO empty, TCK held LOW)
+     *   SM1: passed `wait 0 gpio 4` (TCK is LOW), stalled on `out pins, 1`
+     *        (TX FIFO empty, autopull blocks)
+     *
+     * Starting SM1 TX DMA first fills SM1's FIFO. SM1 then outputs TMS
+     * bit 0 and stalls on `wait 1 gpio 4` (TCK still LOW). The usleep
+     * ensures the kernel has time to start SM1's DMA before SM0's DMA
+     * delivers data and SM0 begins clocking TCK.
+     *
+     * Without this ordering, SM0 could clock 1000+ bits before SM1 gets
+     * its first DMA word, causing TMS to be misaligned with TDI/TCK. */
+    xfer_args_t tx1 = {pio, sm1, PIO_DIR_TO_SM,   sm1_tx_dma, sm1_tx, 0, 0};
     xfer_args_t tx0 = {pio, sm0, PIO_DIR_TO_SM,   sm0_tx_dma, sm0_tx, 0, 0};
     xfer_args_t rx0 = {pio, sm0, PIO_DIR_FROM_SM, sm0_rx_dma, sm0_rx, 0, 0};
-    xfer_args_t tx1 = {pio, sm1, PIO_DIR_TO_SM,   sm1_tx_dma, sm1_tx, 0, 0};
 
-    pthread_t t_tx0, t_rx0, t_tx1;
-    pthread_create(&t_tx0, NULL, xfer_thread, &tx0);
-    pthread_create(&t_rx0, NULL, xfer_thread, &rx0);
-    pthread_create(&t_tx1, NULL, xfer_thread, &tx1);
+    pthread_t t_tx1, t_tx0, t_rx0;
+    pthread_create(&t_tx1, NULL, xfer_thread, &tx1);  /* SM1 TX first (TMS) */
+    usleep(500);  /* Let kernel start SM1 DMA before SM0 clocks */
+    pthread_create(&t_tx0, NULL, xfer_thread, &tx0);  /* SM0 TX (count + TDI) */
+    pthread_create(&t_rx0, NULL, xfer_thread, &rx0);  /* SM0 RX (TDO) */
 
+    pthread_join(t_tx1, NULL);
     pthread_join(t_tx0, NULL);
     pthread_join(t_rx0, NULL);
-    pthread_join(t_tx1, NULL);
 
     /* Disable both state machines */
     pio_sm_set_enabled(pio, sm1, false);
