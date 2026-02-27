@@ -1,0 +1,32 @@
+;
+; jtag_tms.pio - TMS synchronization to TCK (Phase 2)
+;
+; Runs on SM1 alongside jtag_shift.pio on SM0. Reads TMS bit
+; vector from TX FIFO and outputs one bit per TCK cycle,
+; synchronized to SM0's TCK output via wait gpio.
+;
+; Pin assignment:
+;   - OUT pin 0:  TMS (GPIO17, controlled by this SM)
+;   - GPIO wait:  TCK (GPIO4, driven by SM0's sideset)
+;
+; TX FIFO protocol (fed by DMA):
+;   Word 0..M: TMS data, LSB-first, 32 bits per word (autopull)
+;   No count word needed -- SM1 runs until TCK stops toggling.
+;
+; Synchronization:
+;   SM1 waits for TCK LOW, outputs TMS, then waits for TCK HIGH.
+;   When SM0's counter expires, TCK stops toggling and SM1 stalls
+;   on the next wait instruction. No explicit stop signal needed.
+;
+; IMPORTANT: The TCK gpio number is hardcoded in the wait instructions.
+;   The host must patch it at load time if TCK is not on GPIO4.
+;   Use pio_encode_wait_gpio(polarity, gpio) to patch.
+;
+
+.program jtag_tms
+
+.wrap_target
+    wait 0 gpio 4               ; Wait for TCK LOW (SM0 setup phase)
+    out pins, 1                  ; TMS bit from TX FIFO to GPIO17
+    wait 1 gpio 4               ; Wait for TCK HIGH (SM0 sample phase)
+.wrap

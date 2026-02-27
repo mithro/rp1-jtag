@@ -13,26 +13,20 @@
 // ------------- //
 
 #define jtag_loopback_wrap_target 0
-#define jtag_loopback_wrap 7
+#define jtag_loopback_wrap 1
 #define jtag_loopback_pio_version 0
 
 static const uint16_t jtag_loopback_program_instructions[] = {
             //     .wrap_target
-    0x80a0, //  0: pull   block           side 0
-    0x6020, //  1: out    x, 32           side 0
-    0x6041, //  2: out    y, 1            side 0
-    0xa042, //  3: nop                    side 0
-    0xb042, //  4: nop                    side 1
-    0x5041, //  5: in     y, 1            side 1
-    0x0042, //  6: jmp    x--, 2          side 0
-    0x8020, //  7: push   block           side 0
+    0x6020, //  0: out    x, 32
+    0x4020, //  1: in     x, 32
             //     .wrap
 };
 
 #if !PICO_NO_HARDWARE
 static const struct pio_program jtag_loopback_program = {
     .instructions = jtag_loopback_program_instructions,
-    .length = 8,
+    .length = 2,
     .origin = -1,
     .pio_version = jtag_loopback_pio_version,
 #if PICO_PIO_VERSION > 0
@@ -43,8 +37,6 @@ static const struct pio_program jtag_loopback_program = {
 static inline pio_sm_config jtag_loopback_program_get_default_config(uint offset) {
     pio_sm_config c = pio_get_default_sm_config();
     sm_config_set_wrap(&c, offset + jtag_loopback_wrap_target, offset + jtag_loopback_wrap);
-    sm_config_set_sideset(&c, 1, false, false);
     return c;
 }
 #endif
-
