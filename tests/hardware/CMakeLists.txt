@@ -22,6 +22,12 @@ target_link_libraries(bench_throughput rp1jtag_static)
 add_executable(bench_dma_loopback bench_dma_loopback.c)
 target_link_libraries(bench_dma_loopback rp1jtag_static)
 
+add_executable(test_many_shifts test_many_shifts.c)
+target_link_libraries(test_many_shifts rp1jtag_static)
+
+add_executable(test_single_shift test_single_shift.c)
+target_link_libraries(test_single_shift rp1jtag_static)
+
 # Hardware tests are NOT added to CTest (they need real hardware).
 # Run them manually:
 #   sudo ./test_pio_loopback
