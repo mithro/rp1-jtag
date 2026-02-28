@@ -53,6 +53,14 @@ sudo ./build/tests/hardware/test_idcode            # Needs NeTV2
 - Phase 2: DMA for bulk transfers
 - 1 state machine used (of 4 available on RP1's single PIO block)
 
+## Development Methodology
+
+- **Small changes**: Each logical unit of work is its own commit. Never batch multiple unrelated changes.
+- **Frequent commits**: Commit after each step, not at the end. Every file added, every function written, every test passing.
+- **Progress documentation**: Keep `docs/plans/` and `benchmarks/RESULTS.md` updated with findings as they are discovered, not retroactively.
+- **Verification before claims**: Never claim performance improvements without measured data. Run benchmarks at multiple frequencies and report actual numbers.
+- **Hardware testing protocol**: Always test on rpi5-netv2 after local tests pass. Always reset PIO module before testing (`sudo rmmod rp1-pio && sudo modprobe rp1-pio`). Always run test_many_shifts before bitstream tests.
+
 ## NeTV2 JTAG Pins (default)
 
 TCK=GPIO4, TMS=GPIO17, TDI=GPIO27, TDO=GPIO22
