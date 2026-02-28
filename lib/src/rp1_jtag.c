@@ -10,7 +10,7 @@
  * SM1 has no PIO program — it is used solely for its output enable
  * (OE) on TMS. TMS value is set via set_pins_with_mask.
  *
- * Chunks are BULK_CHUNK_BITS (1024 bits) with SM restart per chunk.
+ * Chunks are BULK_CHUNK_BITS with SM restart per chunk.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -110,21 +110,52 @@ void words_to_bits(const uint32_t *words, uint32_t num_words,
 
 #ifdef HAVE_PIOLIB
 
-/* DMA bounce buffer size for both chunked and bulk paths.
- * Matches the kernel's DMA_BOUNCE_BUFFER_SIZE. */
+/* DMA bounce buffer size for config_xfer.
+ *
+ * Must be large enough for the biggest single xfer_data call.
+ * The kernel rounds up to PAGE_SIZE (4096) for the bounce buffer
+ * allocation anyway, so 4096 wastes no memory. */
 #define DMA_BUF_SIZE 4096
 
-/* Single-call DMA thread (used by chunked and bulk paths) */
+/* DMACTRL register overrides for TX and RX DMA.
+ *
+ * Register layout: bit 31 = DREQ_EN, bit 30 = HIGH_PRIORITY,
+ * bits 11:7 = TREQ_SEL (priority), bits 4:0 = DREQ threshold.
+ *
+ * Threshold=4 is used for both TX and RX. Empirical testing with
+ * rpi5-rp1-pio-bench shows that threshold=8 causes 25% data corruption
+ * for DMA transfers < 128 KB, while threshold<=4 works correctly at
+ * all sizes (128 bytes to 256 KB, 0% error rate).
+ *
+ * For RX with fewer than 4 words (shifts < 96 bits), the threshold is
+ * dynamically lowered to 1 per-chunk — otherwise DREQ never fires and
+ * the DMA times out. This is safe for small transfers because the AXI
+ * bus contention that breaks threshold=1 at large sizes is negligible
+ * for transfers of only a few words.
+ *
+ * config_xfer is called at the start of each bulk shift to reset the
+ * kernel's DMA state (semaphore, head/tail indices, pending transfers).
+ * Without this reset, accumulated state from previous shifts can cause
+ * spurious timeouts.
+ *
+ * Must be applied AFTER pio_sm_config_xfer() which resets DMACTRL. */
+#define DMACTRL_TX      0xC0000104  /* enable + high_pri + threshold=4 */
+#define DMACTRL_RX_4    0xC0000104  /* enable + high_pri + threshold=4 */
+#define DMACTRL_RX_1    0xC0000101  /* enable + high_pri + threshold=1 */
+#define DMACTRL_RX_THRESHOLD_MIN_WORDS 4  /* use threshold=4 when >= 4 RX words */
+
+/* DMA transfer thread args */
 typedef struct {
     PIO pio;
     uint sm;
     enum pio_xfer_dir dir;
-    size_t size;
-    void *buf;
+    size_t size;        /* bytes to transfer */
+    void *buf;          /* data buffer */
     int ret;
-    int err;    /* errno captured after pio_sm_xfer_data */
+    int err;            /* errno captured on failure */
 } xfer_args_t;
 
+/* DMA transfer thread: single xfer_data call for the full transfer. */
 static void *xfer_thread(void *arg)
 {
     xfer_args_t *a = (xfer_args_t *)arg;
@@ -171,28 +202,31 @@ static int loopback_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
     bits_to_words(tdi, 0, num_bits, tx_buf);
     memset(rx_buf, 0, dma_bytes);
 
-    /* Configure DMA channels */
+    /* Configure DMA channels for the full transfer size. */
     ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, dma_bytes, 1);
     if (ret < 0) goto cleanup;
     ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM, dma_bytes, 1);
     if (ret < 0) goto cleanup;
 
-    /* NOTE: Do NOT call pio_sm_set_dmactrl() here. The kernel driver
-     * (PR #7190) already sets correct FIFO thresholds in config_xfer.
-     * Manually overriding with 0xC0000108 breaks RX DMA on newer kernels. */
+    /* Override DMACTRL for both TX and RX.
+     * Must come AFTER config_xfer which resets DMACTRL to defaults.
+     * RX threshold depends on word count (threshold=4 needs >= 4 words). */
+    pio_sm_set_dmactrl(pio, sm0, true,  DMACTRL_TX);
+    pio_sm_set_dmactrl(pio, sm0, false,
+                       num_data_words >= DMACTRL_RX_THRESHOLD_MIN_WORDS
+                       ? DMACTRL_RX_4 : DMACTRL_RX_1);
 
     /* Enable state machine */
     pio_sm_set_enabled(pio, sm0, true);
 
-    /* Launch 2 concurrent DMA threads */
+    /* Launch RX DMA first (background thread), TX in main thread.
+     * RX must be ready before TX to prevent RX FIFO overflow. */
     xfer_args_t tx_args = {pio, sm0, PIO_DIR_TO_SM,   dma_bytes, tx_buf, 0, 0};
     xfer_args_t rx_args = {pio, sm0, PIO_DIR_FROM_SM, dma_bytes, rx_buf, 0, 0};
 
-    pthread_t t_tx, t_rx;
-    pthread_create(&t_tx, NULL, xfer_thread, &tx_args);
+    pthread_t t_rx;
     pthread_create(&t_rx, NULL, xfer_thread, &rx_args);
-
-    pthread_join(t_tx, NULL);
+    xfer_thread(&tx_args);
     pthread_join(t_rx, NULL);
 
     /* Disable state machine */
@@ -236,10 +270,8 @@ cleanup:
  *            Non-byte-aligned offsets use bits_to_words/words_to_bits.
  *
  * Architecture: BULK_CHUNK_BITS chunks with SM restart per chunk.
- * The RP1 DMA completion callback fails for slow SM programs
- * at larger transfer sizes, so each chunk is a complete PIO
- * transfer (count word + data). DMA config from init
- * (DMA_BUF_SIZE=4096) is reused — no per-chunk config_xfer.
+ * Each chunk is a complete PIO transfer (count word + data in,
+ * TDO out). SM restart between chunks ensures clean FIFO state.
  */
 static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
                            bool tms_value, const uint8_t *tdi,
@@ -254,6 +286,21 @@ static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
      * SM1 is never enabled — no need to disable it. */
     pio_sm_set_enabled(pio, sm0, false);
 
+    /* Reset DMA state before each shift.
+     *
+     * config_xfer terminates any pending DMA, resets the kernel's
+     * semaphore and head/tail indices, and reallocates bounce buffers.
+     * Without this, accumulated state from previous shifts (e.g.
+     * spurious semaphore counts or stale DMA descriptors) can cause
+     * the TX DMA to time out on subsequent shifts. */
+    if (pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, DMA_BUF_SIZE, 1) < 0 ||
+        pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM, DMA_BUF_SIZE, 1) < 0) {
+        fprintf(stderr, "rp1_jtag: config_xfer reset failed\n");
+        return RP1_JTAG_ERR_IO;
+    }
+    /* Set TX DMACTRL (threshold=4, applied once for all chunks) */
+    pio_sm_set_dmactrl(pio, sm0, true, DMACTRL_TX);
+
     /* Set TMS as constant GPIO output via SM1.
      * SM1 has output enable (OE) for the TMS pin, set during init.
      * set_pins_with_mask works on a disabled SM. */
@@ -261,9 +308,9 @@ static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
     uint32_t tms_val = tms_value ? tms_mask : 0;
     pio_sm_set_pins_with_mask(pio, sm1, tms_val, tms_mask);
 
-    /* Allocate buffers for max chunk size (BULK_CHUNK_BITS = 1024 bits).
-     * TX: 1 count word + 32 data words = 132 bytes.
-     * RX: 32 autopush words + 1 explicit push = 132 bytes. */
+    /* Allocate buffers for max chunk size (BULK_CHUNK_BITS bits).
+     * TX: 1 count word + data words.
+     * RX: autopush words + 1 explicit push. */
     const uint32_t max_data_words = BULK_CHUNK_BITS / BITS_PER_WORD;
     const size_t max_tx_bytes = (1 + max_data_words) * sizeof(uint32_t);
     const size_t max_rx_bytes = (max_data_words + 1) * sizeof(uint32_t);
@@ -276,9 +323,7 @@ static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
         return RP1_JTAG_ERR_IO;
     }
 
-    /* Process in BULK_CHUNK_BITS chunks with SM restart per chunk.
-     * Each chunk is a complete PIO transfer: count word + TDI data
-     * in, TDO data out. DMA config from init is reused. */
+    /* Process in BULK_CHUNK_BITS chunks with SM restart per chunk. */
     uint32_t bit_offset = 0;
     while (bit_offset < num_bits) {
         uint32_t chunk_bits = num_bits - bit_offset;
@@ -301,9 +346,7 @@ static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
         uint32_t abs_bit = start_bit + bit_offset;
 
         if (abs_bit % 8 == 0) {
-            /* Byte-aligned: use memcpy (fast path).
-             * On little-endian ARM64, byte layout of uint8_t[] bit vectors
-             * (LSB-first) matches byte layout of uint32_t[] words. */
+            /* Byte-aligned: use memcpy (fast path) */
             uint32_t byte_off = abs_bit / 8;
             uint32_t full_words = chunk_bits / 32;
             if (full_words > 0)
@@ -318,45 +361,63 @@ static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
                 tx_buf[1 + full_words] = last_word;
             }
         } else {
-            /* Non-byte-aligned: use bits_to_words (correct for any offset) */
             bits_to_words(tdi, abs_bit, chunk_bits, &tx_buf[1]);
         }
 
         memset(rx_buf, 0, chunk_rx_bytes);
 
-        /* SM restart per chunk (proven pattern: disable → restart →
-         * jmp to program start → enable). Required because the SM
-         * stalls in an unpredictable state after DMA completion. */
+        /* Set RX DMACTRL per-chunk: threshold=4 when enough RX words,
+         * threshold=1 for small chunks (< 4 RX words) where DREQ at
+         * threshold=4 would never fire. */
+        uint32_t rx_dmactrl = (chunk_rx_words >= DMACTRL_RX_THRESHOLD_MIN_WORDS)
+                              ? DMACTRL_RX_4 : DMACTRL_RX_1;
+        pio_sm_set_dmactrl(pio, sm0, false, rx_dmactrl);
+
+        /* SM restart per chunk: disable → clear FIFOs → restart → jmp → enable.
+         * pio_sm_restart resets shift counters and stall flags but does NOT
+         * clear FIFOs — stale data in RX FIFO causes premature DMA completion
+         * and TX backpressure timeout. */
         pio_sm_set_enabled(pio, sm0, false);
+        pio_sm_clear_fifos(pio, sm0);
         pio_sm_restart(pio, sm0);
         pio_sm_exec(pio, sm0, pio_encode_jmp(jtag->offset0));
         pio_sm_set_enabled(pio, sm0, true);
 
-        /* Launch concurrent TX/RX DMA */
+        /* Launch RX DMA first (background thread), TX in main thread.
+         * RX must be ready before TX to prevent RX FIFO overflow. */
         xfer_args_t tx_args = {pio, sm0, PIO_DIR_TO_SM,
                                chunk_tx_bytes, tx_buf, 0, 0};
         xfer_args_t rx_args = {pio, sm0, PIO_DIR_FROM_SM,
                                chunk_rx_bytes, rx_buf, 0, 0};
 
-        pthread_t t_tx, t_rx;
-        pthread_create(&t_tx, NULL, xfer_thread, &tx_args);
+        pthread_t t_rx;
         pthread_create(&t_rx, NULL, xfer_thread, &rx_args);
-        pthread_join(t_tx, NULL);
+        xfer_thread(&tx_args);
         pthread_join(t_rx, NULL);
 
         if (tx_args.ret < 0 || rx_args.ret < 0) {
+            /* Diagnostic: check FIFO state after failure */
+            uint32_t tx_level = pio_sm_get_tx_fifo_level(pio, sm0);
+            uint32_t rx_level = pio_sm_get_rx_fifo_level(pio, sm0);
             fprintf(stderr, "rp1_jtag: DMA chunk failed at bit %u "
                     "(tx=%d[%s], rx=%d[%s])\n",
                     abs_bit,
                     tx_args.ret, strerror(tx_args.err),
                     rx_args.ret, strerror(rx_args.err));
+            fprintf(stderr, "rp1_jtag: FIFO levels after fail: "
+                    "TX=%u RX=%u (expected TX=0, RX=0)\n",
+                    tx_level, rx_level);
+            fprintf(stderr, "rp1_jtag: Transfer sizes: "
+                    "chunk_bits=%u tx_bytes=%zu(%zu words) "
+                    "rx_bytes=%zu(%zu words)\n",
+                    chunk_bits, chunk_tx_bytes,
+                    chunk_tx_bytes / 4, chunk_rx_bytes,
+                    chunk_rx_bytes / 4);
             ret = RP1_JTAG_ERR_IO;
             break;
         }
 
-        /* Fix partial-word alignment from PIO right-shift ISR.
-         * Full 32-bit words from autopush are correctly aligned,
-         * but the last explicit push word needs right-shifting. */
+        /* Fix partial-word alignment from PIO right-shift ISR */
         {
             uint32_t remainder = chunk_bits % BITS_PER_WORD;
             if (remainder != 0) {
@@ -367,7 +428,6 @@ static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
         /* Unpack TDO */
         if (tdo) {
             if (abs_bit % 8 == 0) {
-                /* Byte-aligned: use memcpy (fast path) */
                 uint32_t byte_off = abs_bit / 8;
                 uint32_t full_words = chunk_bits / 32;
                 if (full_words > 0)
@@ -379,7 +439,6 @@ static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
                            &rx_buf[full_words], remaining_bytes);
                 }
             } else {
-                /* Non-byte-aligned: use words_to_bits */
                 words_to_bits(rx_buf, chunk_data_words,
                               tdo, abs_bit, chunk_bits);
             }
@@ -491,12 +550,9 @@ rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
     pio_gpio_init(pio, pins->tms);
     pio_sm_set_consecutive_pindirs(pio, (uint)sm1, pins->tms, 1, true);   /* TMS output */
 
-    /* Configure DMA bounce buffers for SM0 (once at init).
-     *
-     * buf_size=DMA_BUF_SIZE (4096) matches the kernel's
-     * DMA_BOUNCE_BUFFER_SIZE. Actual transfer sizes in xfer_data
-     * can be smaller. The bulk path reuses this config without
-     * per-chunk config_xfer calls. */
+    /* Initial DMA config for SM0. This sets up bounce buffers in the
+     * kernel. jtag_shift_bulk() calls config_xfer again before each
+     * shift to reset accumulated DMA state (semaphore, indices). */
     int dma_ret;
     dma_ret = pio_sm_config_xfer(pio, (uint)sm0, PIO_DIR_TO_SM, DMA_BUF_SIZE, 1);
     if (dma_ret < 0) {
