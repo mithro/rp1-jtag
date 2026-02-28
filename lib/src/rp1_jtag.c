@@ -102,10 +102,15 @@ void words_to_bits(const uint32_t *words, uint32_t num_words,
     }
 }
 
-/* ---- DMA thread wrapper ---- */
+/* ---- DMA thread wrappers ---- */
 
 #ifdef HAVE_PIOLIB
 
+/* DMA bounce buffer size for chunked (two-SM) path.
+ * Matches the kernel's DMA_BOUNCE_BUFFER_SIZE. */
+#define DMA_BUF_SIZE 4096
+
+/* Single-call DMA thread (used by chunked path) */
 typedef struct {
     PIO pio;
     uint sm;
@@ -122,6 +127,51 @@ static void *xfer_thread(void *arg)
     errno = 0;
     a->ret = pio_sm_xfer_data(a->pio, a->sm, a->dir, a->size, a->buf);
     a->err = errno;
+    return NULL;
+}
+
+/* Looping DMA thread (used by bulk path).
+ * Splits total_bytes into BULK_DMA_SIZE chunks, ensuring no chunk
+ * is smaller than MIN_DMA_BYTES (kernel minimum). */
+typedef struct {
+    PIO pio;
+    uint sm;
+    enum pio_xfer_dir dir;
+    uint8_t *buf;
+    size_t total_bytes;
+    int ret;
+    int err;
+} bulk_xfer_args_t;
+
+static void *bulk_xfer_thread(void *arg)
+{
+    bulk_xfer_args_t *a = (bulk_xfer_args_t *)arg;
+    uint8_t *ptr = a->buf;
+    size_t remaining = a->total_bytes;
+    a->ret = 0;
+
+    while (remaining > 0) {
+        size_t chunk = remaining;
+        if (chunk > BULK_DMA_SIZE)
+            chunk = BULK_DMA_SIZE;
+
+        /* If the next chunk would be smaller than MIN_DMA_BYTES,
+         * shrink this chunk to leave at least MIN_DMA_BYTES for next. */
+        if (remaining > chunk && remaining - chunk < MIN_DMA_BYTES)
+            chunk = remaining - MIN_DMA_BYTES;
+
+        errno = 0;
+        int rc = pio_sm_xfer_data(a->pio, a->sm, a->dir, chunk, ptr);
+        if (rc < 0) {
+            a->ret = rc;
+            a->err = errno;
+            return NULL;
+        }
+        ptr += chunk;
+        remaining -= chunk;
+    }
+
+    a->err = 0;
     return NULL;
 }
 
@@ -378,6 +428,152 @@ cleanup:
     return ret;
 }
 
+/* ---- Bulk JTAG shift via DMA (single SM, constant TMS) ---- */
+
+/*
+ * Shift num_bits through JTAG using bulk DMA with SM0 only.
+ * TMS is driven as a constant GPIO output (not via SM1/DMA).
+ *
+ * This path is used when TMS is constant for the entire shift
+ * (e.g., bitstream programming in Shift-DR with TMS=0). It
+ * eliminates the SM1 DMA bottleneck by using 256 KB DMA buffers
+ * instead of 704-bit chunks, reducing ioctl count from ~478,000
+ * to ~30 for a 3.8 MB bitstream.
+ *
+ * Architecture (matching rpi5-rp1-pio-bench benchmark):
+ *   - pio_sm_config_xfer(BULK_DMA_SIZE) for SM0 TX and RX
+ *   - Two concurrent pthreads (TX loop + RX loop)
+ *   - Each thread calls pio_sm_xfer_data in BULK_DMA_SIZE chunks
+ */
+static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
+                           bool tms_value, const uint8_t *tdi,
+                           uint8_t *tdo)
+{
+    PIO pio = (PIO)jtag->pio;
+    uint sm0 = (uint)jtag->sm0;
+    uint sm1 = (uint)jtag->sm1;
+    int ret = 0;
+    uint32_t *tx_buf = NULL;
+    uint32_t *rx_buf = NULL;
+
+    /* Disable both SMs. SM0 may be stalled from a previous shift,
+     * SM1 must be stopped so it doesn't drive TMS. */
+    pio_sm_set_enabled(pio, sm0, false);
+    pio_sm_set_enabled(pio, sm1, false);
+
+    /* Set TMS as constant GPIO output.
+     * pio_sm_set_pins_with_mask temporarily reconfigures the SM's
+     * set pin group to drive the target pin directly. SM1 will
+     * override this when re-enabled in the next chunked shift. */
+    uint32_t tms_mask = 1u << jtag->pins.tms;
+    uint32_t tms_val = tms_value ? tms_mask : 0;
+    pio_sm_set_pins_with_mask(pio, sm0, tms_val, tms_mask);
+
+    /* Reconfigure DMA for large buffers (256 KB) */
+    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, BULK_DMA_SIZE, 1);
+    if (ret < 0) { ret = RP1_JTAG_ERR_IO; goto restore; }
+    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM, BULK_DMA_SIZE, 1);
+    if (ret < 0) { ret = RP1_JTAG_ERR_IO; goto restore; }
+
+    /* Reset SM0 and jump to program start */
+    pio_sm_restart(pio, sm0);
+    pio_sm_exec(pio, sm0, pio_encode_jmp(jtag->offset0));
+
+    /* Calculate buffer sizes.
+     * TX: 1 count word + ceil(N/32) TDI data words.
+     * RX: floor(N/32) autopush words + 1 explicit push word. */
+    uint32_t num_data_words = bits_to_word_count(num_bits);
+    uint32_t sm0_rx_words = num_bits / BITS_PER_WORD + 1;
+    size_t tx_total_bytes = (1 + num_data_words) * sizeof(uint32_t);
+    size_t rx_total_bytes = sm0_rx_words * sizeof(uint32_t);
+
+    /* Allocate aligned buffers for DMA */
+    size_t tx_alloc = (tx_total_bytes + 63) & ~(size_t)63;
+    size_t rx_alloc = (rx_total_bytes + 63) & ~(size_t)63;
+    tx_buf = (uint32_t *)aligned_alloc(64, tx_alloc);
+    rx_buf = (uint32_t *)aligned_alloc(64, rx_alloc);
+    if (!tx_buf || !rx_buf) { ret = RP1_JTAG_ERR_IO; goto restore; }
+    memset(tx_buf, 0, tx_alloc);
+    memset(rx_buf, 0, rx_alloc);
+
+    /* Pack count word + TDI data.
+     * On little-endian ARM64, the byte layout of uint8_t[] bit vectors
+     * (LSB-first) matches the byte layout of uint32_t[] words, so
+     * bits_to_words() for byte-aligned data degenerates to memcpy. */
+    tx_buf[0] = num_bits - 1;  /* count word */
+    uint32_t full_words = num_bits / 32;
+    if (full_words > 0)
+        memcpy(&tx_buf[1], tdi, full_words * 4);
+    if (num_bits % 32) {
+        uint32_t last_word = 0;
+        uint32_t remaining_bits = num_bits % 32;
+        uint32_t remaining_bytes = (remaining_bits + 7) / 8;
+        memcpy(&last_word, tdi + full_words * 4, remaining_bytes);
+        last_word &= (1u << remaining_bits) - 1;
+        tx_buf[1 + full_words] = last_word;
+    }
+
+    /* Enable SM0 only (SM1 stays disabled — TMS is driven by GPIO) */
+    pio_sm_set_enabled(pio, sm0, true);
+
+    /* Launch two concurrent DMA threads.
+     * TX sends count + TDI data, RX receives TDO data.
+     * Each thread loops over BULK_DMA_SIZE chunks.
+     * The SM autopull/autopush pipeline self-balances between them. */
+    bulk_xfer_args_t tx_args = {pio, sm0, PIO_DIR_TO_SM,
+                                (uint8_t *)tx_buf, tx_total_bytes, 0, 0};
+    bulk_xfer_args_t rx_args = {pio, sm0, PIO_DIR_FROM_SM,
+                                (uint8_t *)rx_buf, rx_total_bytes, 0, 0};
+
+    pthread_t t_tx, t_rx;
+    pthread_create(&t_tx, NULL, bulk_xfer_thread, &tx_args);
+    pthread_create(&t_rx, NULL, bulk_xfer_thread, &rx_args);
+
+    pthread_join(t_tx, NULL);
+    pthread_join(t_rx, NULL);
+
+    /* Check for DMA errors */
+    if (tx_args.ret < 0 || rx_args.ret < 0) {
+        fprintf(stderr, "rp1_jtag: bulk DMA failed "
+                "(tx=%d[%s], rx=%d[%s])\n",
+                tx_args.ret, strerror(tx_args.err),
+                rx_args.ret, strerror(rx_args.err));
+        ret = RP1_JTAG_ERR_IO;
+        goto restore;
+    }
+
+    /* Fix partial-word alignment from PIO right-shift ISR.
+     * Same logic as the chunked path — the last explicit push
+     * word needs right-shifting when num_bits is not a multiple of 32. */
+    {
+        uint32_t remainder = num_bits % BITS_PER_WORD;
+        if (remainder != 0) {
+            rx_buf[num_data_words - 1] >>= (BITS_PER_WORD - remainder);
+        }
+    }
+
+    /* Unpack TDO using memcpy (same LE ARM64 optimization as packing) */
+    if (tdo) {
+        if (full_words > 0)
+            memcpy(tdo, rx_buf, full_words * 4);
+        if (num_bits % 32) {
+            uint32_t remaining_bits = num_bits % 32;
+            uint32_t remaining_bytes = (remaining_bits + 7) / 8;
+            memcpy(tdo + full_words * 4, &rx_buf[full_words], remaining_bytes);
+        }
+    }
+
+    ret = 0;
+
+restore:
+    free(tx_buf);
+    free(rx_buf);
+    /* Restore DMA config for chunked path */
+    pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, DMA_BUF_SIZE, 1);
+    pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM, DMA_BUF_SIZE, 1);
+    return ret;
+}
+
 /* ---- Public API (with PIOLib) ---- */
 
 rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
@@ -489,13 +685,13 @@ rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
 
     /* Configure DMA bounce buffers for all channels (once at init).
      *
-     * buf_size=4096 matches the kernel's DMA_BOUNCE_BUFFER_SIZE.
-     * Actual transfer sizes in xfer_data can be smaller.
+     * buf_size=DMA_BUF_SIZE (4096) matches the kernel's
+     * DMA_BOUNCE_BUFFER_SIZE. Actual transfer sizes in xfer_data
+     * can be smaller. The bulk path reconfigures SM0 to BULK_DMA_SIZE.
      *
      * NOTE: SM1 TX DMA has a size limit (~88 bytes / 22 words) beyond
      * which it times out. Chunk sizes in rp1_jtag_shift are set to stay
      * within this limit via MAX_CHUNK_BITS. */
-    #define DMA_BUF_SIZE 4096
     int dma_ret;
     dma_ret = pio_sm_config_xfer(pio, (uint)sm0, PIO_DIR_TO_SM, DMA_BUF_SIZE, 1);
     if (dma_ret < 0) {
@@ -691,11 +887,46 @@ int rp1_jtag_shift(rp1_jtag_t *jtag, uint32_t num_bits,
         if (!tms)
             return RP1_JTAG_ERR_PARAM;
 
-        /* Chunk large transfers to stay within PIOLib's DMA timeout.
+        /* Check if TMS is constant (all same value) for the bulk path.
+         * Scan TMS bytes: if all full bytes match and the last partial
+         * byte matches in its used bits, TMS is constant. This is fast
+         * (~0.5 us for 3.8 MB on ARM64). */
+        bool tms_is_constant = false;
+        bool tms_value = false;
+
+        if (num_bits >= BULK_THRESHOLD) {
+            uint32_t tms_full_bytes = num_bits / 8;
+            uint8_t expected = (tms[0] & 1) ? 0xFF : 0x00;
+
+            tms_is_constant = true;
+            for (uint32_t i = 0; i < tms_full_bytes; i++) {
+                if (tms[i] != expected) {
+                    tms_is_constant = false;
+                    break;
+                }
+            }
+
+            /* Check last partial byte (only the used bits) */
+            if (tms_is_constant && (num_bits % 8 != 0)) {
+                uint8_t mask = (1u << (num_bits % 8)) - 1;
+                if ((tms[tms_full_bytes] & mask) != (expected & mask))
+                    tms_is_constant = false;
+            }
+
+            if (tms_is_constant)
+                tms_value = (expected != 0);
+        }
+
+        /* Constant TMS + enough bits: use single-SM bulk DMA path.
+         * This eliminates SM1 and its 704-bit chunk limit, using
+         * 256 KB DMA buffers instead (~30 ioctls vs ~478,000). */
+        if (tms_is_constant)
+            return jtag_shift_bulk(jtag, num_bits, tms_value, tdi, tdo);
+
+        /* Variable TMS or short transfer: use two-SM chunked path.
          * Each chunk is a complete PIO transfer with its own count word.
          * Chunks are at 32-bit word boundaries so byte pointer arithmetic
-         * stays aligned. The JTAG TAP state is maintained between chunks
-         * (TMS is passed through per-bit, not modified by chunking). */
+         * stays aligned. */
         uint32_t offset = 0;
         while (offset < num_bits) {
             uint32_t chunk = num_bits - offset;
