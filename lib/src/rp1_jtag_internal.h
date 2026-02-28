@@ -1,5 +1,5 @@
 /*
- * rp1_jtag_internal.h - Internal types for librp1jtag (Phase 2 DMA)
+ * rp1_jtag_internal.h - Internal types for librp1jtag
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -36,19 +36,6 @@
 
 /* Maximum bits per DMA transfer chunk.
  *
- * Limited by SM1 TX DMA: the RP1 PIO kernel driver's DMA path for SM1 TX
- * times out for transfers exceeding ~22-23 words. With PIO_FIFO_JOIN_TX
- * on SM1, the limit is ~23 words (736 bits). SM1 TX carries ceil(N/32)
- * words of TMS data per chunk.
- *
- * MAX_CHUNK_BITS = 704 gives SM1 TX = 22 words = 88 bytes, just at the
- * known working limit without FIFO join and safely under with join.
- *
- * Must be a multiple of BITS_PER_WORD (32) for word-aligned chunking. */
-#define MAX_CHUNK_BITS          704
-
-/* Maximum bits per bulk DMA chunk (single-SM, constant TMS path).
- *
  * The RP1 PIO kernel driver's DMA completion callback fails for
  * transfers exceeding ~1024 bits on slow SM programs (4 instr/bit).
  * Workaround: chunk into 1024-bit transfers with SM restart between
@@ -60,15 +47,9 @@
  * Must be a multiple of BITS_PER_WORD (32). */
 #define BULK_CHUNK_BITS         1024
 
-/* Minimum bit count for bulk DMA path.
- * Below this threshold, the chunked two-SM path is used even for
- * constant TMS. Must be > BITS_PER_WORD to ensure at least one
- * DMA word. */
-#define BULK_THRESHOLD          1024
-
 /* Operating mode */
 typedef enum {
-    MODE_JTAG,      /* Normal JTAG mode: two SMs, GPIO pins */
+    MODE_JTAG,      /* Normal JTAG mode: SM0 DMA + SM1 TMS GPIO */
     MODE_LOOPBACK,  /* Internal PIO loopback: single SM, no GPIO */
 } rp1_jtag_mode_t;
 

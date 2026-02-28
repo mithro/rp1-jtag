@@ -1,18 +1,16 @@
 /*
- * rp1_jtag.c - Core library implementation (Phase 2 DMA)
+ * rp1_jtag.c - Core library implementation
  *
- * Two transfer paths, selected automatically:
- *
- * Chunked path (variable TMS):
+ * All JTAG shifts use SM0-only DMA:
  *   SM0: TDI/TDO/TCK (jtag_shift program, 4 instr/bit counted loop)
- *   SM1: TMS (jtag_tms program, synchronized to SM0's TCK via GPIO wait)
- *   Three concurrent pthreads: SM0 TX, SM0 RX, SM1 TX
- *   Chunk size limited to MAX_CHUNK_BITS by SM1 TX DMA timeout.
+ *   SM1: TMS driven as GPIO output via set_pins_with_mask (no DMA)
  *
- * Bulk path (constant TMS, e.g. bitstream programming):
- *   SM0 only, TMS driven as constant GPIO output (no SM1).
- *   1024-bit chunks with SM restart per chunk.
- *   Eliminates SM1 DMA bottleneck for constant-TMS runs.
+ * Variable-TMS vectors are split into constant-value runs, each
+ * dispatched as a separate SM0 DMA transfer with TMS set via GPIO.
+ * SM1 has no PIO program — it is used solely for its output enable
+ * (OE) on TMS. TMS value is set via set_pins_with_mask.
+ *
+ * Chunks are BULK_CHUNK_BITS (1024 bits) with SM restart per chunk.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -30,7 +28,7 @@
 #ifdef HAVE_PIOLIB
 #include "piolib.h"
 #include "pio/generated/jtag_shift.pio.h"
-#include "pio/generated/jtag_tms.pio.h"
+/* jtag_tms.pio.h no longer needed — SM1 uses set_pins_with_mask */
 #include "pio/generated/jtag_loopback.pio.h"
 #endif
 
@@ -137,171 +135,6 @@ static void *xfer_thread(void *arg)
 }
 
 
-/* ---- Core JTAG shift via DMA (two SMs) ---- */
-
-/*
- * Shift num_bits through JTAG using DMA with SM0 (TDI/TDO/TCK) and
- * SM1 (TMS). DMA transfers run concurrently:
- *   - SM1 TX: TMS data (background thread, started first)
- *   - SM0 RX: TDO data (background thread)
- *   - SM0 TX: count word + TDI data (calling thread)
- */
-static int jtag_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
-                           const uint8_t *tms, const uint8_t *tdi,
-                           uint8_t *tdo)
-{
-    PIO pio = (PIO)jtag->pio;
-    uint sm0 = (uint)jtag->sm0;
-    uint sm1 = (uint)jtag->sm1;
-    int ret = 0;
-
-    /* Reset both SMs to program start with clean shift counters.
-     *
-     * After a previous shift, SM1 may be stalled mid-program
-     * (at `wait 1 gpio 4` instead of program start). Without
-     * resetting, SM1 misses the first TMS output on the next
-     * shift, causing TMS to be delayed by one bit.
-     *
-     * pio_sm_restart() clears shift counters (ISR/OSR count = 0),
-     * which triggers autopull on SM1's first `out pins, 1`,
-     * correctly loading fresh TMS data from the FIFO.
-     *
-     * clear_fifos is not needed: FIFOs are empty after a completed
-     * DMA transfer (all data consumed by SM / read by DMA).
-     * pio_select is not needed: only used by sm_config_set_*
-     * functions, not by pio_sm_exec or pio_sm_restart. */
-    pio_sm_set_enabled(pio, sm0, false);
-    pio_sm_set_enabled(pio, sm1, false);
-    pio_sm_restart(pio, sm0);
-    pio_sm_restart(pio, sm1);
-    pio_sm_exec(pio, sm0, pio_encode_jmp(jtag->offset0));
-    pio_sm_exec(pio, sm1, pio_encode_jmp(jtag->offset1));
-
-    /* Calculate buffer sizes.
-     *
-     * SM0 TX: 1 count word + ceil(N/32) TDI data words.
-     * SM0 RX: The PIO program produces floor(N/32) autopush words
-     *         plus 1 explicit push word = floor(N/32) + 1 total.
-     *         This differs from ceil(N/32) when N is a multiple of 32.
-     * SM1 TX: ceil(N/32) TMS data words (no count word).
-     *
-     * Enforce MIN_DMA_BYTES since PIOLib can't DMA single words. */
-    uint32_t num_data_words = bits_to_word_count(num_bits);
-    uint32_t sm0_rx_words = num_bits / BITS_PER_WORD + 1;  /* autopush + final push */
-    size_t sm0_tx_bytes = (1 + num_data_words) * sizeof(uint32_t);  /* count + TDI */
-    size_t sm0_rx_bytes = sm0_rx_words * sizeof(uint32_t);          /* TDO */
-    size_t sm1_tx_bytes = num_data_words * sizeof(uint32_t);        /* TMS */
-
-    /* DMA transfer sizes (padded to minimum) */
-    size_t sm0_tx_dma = sm0_tx_bytes < MIN_DMA_BYTES ? MIN_DMA_BYTES : sm0_tx_bytes;
-    size_t sm0_rx_dma = sm0_rx_bytes < MIN_DMA_BYTES ? MIN_DMA_BYTES : sm0_rx_bytes;
-    size_t sm1_tx_dma = sm1_tx_bytes < MIN_DMA_BYTES ? MIN_DMA_BYTES : sm1_tx_bytes;
-
-    /* Allocate aligned buffers for DMA.
-     * C11 requires aligned_alloc size to be a multiple of alignment. */
-    size_t sm0_tx_alloc = (sm0_tx_dma + 63) & ~(size_t)63;
-    size_t sm0_rx_alloc = (sm0_rx_dma + 63) & ~(size_t)63;
-    size_t sm1_tx_alloc = (sm1_tx_dma + 63) & ~(size_t)63;
-    uint32_t *sm0_tx = (uint32_t *)aligned_alloc(64, sm0_tx_alloc);
-    uint32_t *sm0_rx = (uint32_t *)aligned_alloc(64, sm0_rx_alloc);
-    uint32_t *sm1_tx = (uint32_t *)aligned_alloc(64, sm1_tx_alloc);
-    if (!sm0_tx || !sm0_rx || !sm1_tx) {
-        free(sm0_tx);
-        free(sm0_rx);
-        free(sm1_tx);
-        return RP1_JTAG_ERR_IO;
-    }
-
-    /* Pack data into word buffers, zero-pad any DMA padding */
-    memset(sm0_tx, 0, sm0_tx_dma);
-    memset(sm1_tx, 0, sm1_tx_dma);
-    sm0_tx[0] = num_bits - 1;                        /* count word */
-    bits_to_words(tdi, 0, num_bits, &sm0_tx[1]);     /* TDI data */
-    bits_to_words(tms, 0, num_bits, sm1_tx);         /* TMS data */
-    memset(sm0_rx, 0, sm0_rx_dma);                   /* clear RX buffer */
-
-    /* NOTE: DMA channels are configured once during init via
-     * pio_sm_config_xfer(). Per-shift transfers use xfer_data only. */
-
-    /* Enable both state machines */
-    pio_sm_set_enabled(pio, sm0, true);
-    pio_sm_set_enabled(pio, sm1, true);
-
-    /* Launch DMA transfers: 2 threads + calling thread.
-     *
-     * ORDERING: SM1 TX (TMS) must start before SM0 TX (TDI/TCK).
-     *
-     * At this point both SMs are enabled but stalled:
-     *   SM0: stalled on `pull side 0` (TX FIFO empty, TCK held LOW)
-     *   SM1: passed `wait 0 gpio 4` (TCK is LOW), stalled on `out pins, 1`
-     *        (TX FIFO empty, autopull blocks)
-     *
-     * SM1 TX and SM0 RX run as background threads. SM0 TX runs on
-     * the calling thread. Thread creation gives SM1 TX a head start:
-     * by the time SM0 TX calls xfer_data (~50-100 µs later, after
-     * creating both threads), SM1's DMA is already being set up in
-     * the kernel. This replaces the previous usleep(500) and also
-     * eliminates one pthread_create/join pair. */
-    xfer_args_t tx1 = {pio, sm1, PIO_DIR_TO_SM,   sm1_tx_dma, sm1_tx, 0, 0};
-    xfer_args_t rx0 = {pio, sm0, PIO_DIR_FROM_SM, sm0_rx_dma, sm0_rx, 0, 0};
-
-    pthread_t t_tx1, t_rx0;
-    pthread_create(&t_tx1, NULL, xfer_thread, &tx1);  /* SM1 TX first (TMS) */
-    pthread_create(&t_rx0, NULL, xfer_thread, &rx0);  /* SM0 RX (TDO) */
-
-    /* SM0 TX on calling thread — SM1 TX thread has head start from
-     * the time spent creating both threads above. */
-    int tx0_ret, tx0_err;
-    errno = 0;
-    tx0_ret = pio_sm_xfer_data(pio, sm0, PIO_DIR_TO_SM, sm0_tx_dma, sm0_tx);
-    tx0_err = errno;
-
-    pthread_join(t_tx1, NULL);
-    pthread_join(t_rx0, NULL);
-
-    /* SMs are left enabled but stalled (SM0 at `pull side 0`,
-     * SM1 at `out pins, 1` waiting for autopull). Next call's
-     * reset handles disable, and rp1_jtag_close() cleans up. */
-
-    /* Check for DMA errors */
-    if (tx0_ret < 0 || rx0.ret < 0 || tx1.ret < 0) {
-        fprintf(stderr, "rp1_jtag: DMA transfer failed "
-                "(tx0=%d[%s], rx0=%d[%s], tx1=%d[%s])\n",
-                tx0_ret, strerror(tx0_err),
-                rx0.ret, strerror(rx0.err),
-                tx1.ret, strerror(tx1.err));
-        ret = RP1_JTAG_ERR_IO;
-        goto cleanup;
-    }
-
-    /* Fix partial-word alignment from PIO right-shift ISR.
-     *
-     * With in_shift_right=true, each `in pins, 1` shifts data into the
-     * ISR from the MSB end. After N shifts (N < 32), valid data sits in
-     * bits [(32-N)..31], not bits [0..(N-1)]. Full 32-bit words from
-     * autopush are correctly aligned, but the last partial word from
-     * the explicit `push` instruction needs right-shifting. */
-    {
-        uint32_t remainder = num_bits % BITS_PER_WORD;
-        if (remainder != 0) {
-            sm0_rx[num_data_words - 1] >>= (BITS_PER_WORD - remainder);
-        }
-    }
-
-    /* Unpack TDO words into output bit vector */
-    if (tdo) {
-        words_to_bits(sm0_rx, num_data_words, tdo, 0, num_bits);
-    }
-
-    ret = 0;
-
-cleanup:
-    free(sm0_tx);
-    free(sm0_rx);
-    free(sm1_tx);
-    return ret;
-}
-
 /* ---- Loopback shift via DMA (single SM, no TMS) ---- */
 
 /*
@@ -389,47 +222,44 @@ cleanup:
     return ret;
 }
 
-/* ---- Bulk JTAG shift via DMA (single SM, constant TMS) ---- */
+/* ---- SM0-only JTAG shift via DMA (constant TMS) ---- */
 
 /*
- * Shift num_bits through JTAG using bulk DMA with SM0 only.
- * TMS is driven as a constant GPIO output (not via SM1/DMA).
+ * Shift num_bits through JTAG using SM0-only DMA.
+ * TMS is driven as a constant GPIO output via SM1's set_pins_with_mask.
  *
- * This path is used when TMS is constant for the entire shift
- * (e.g., bitstream programming in Shift-DR with TMS=0). It
- * eliminates SM1 and its 704-bit chunk limit.
+ * The caller splits variable-TMS vectors into constant-value runs
+ * and dispatches each run to this function. SM1 DMA is not used.
  *
- * Architecture: 1024-bit chunks with SM restart per chunk.
+ * start_bit: Offset into the tdi/tdo bit vectors.
+ *            Byte-aligned offsets use memcpy for fast data packing.
+ *            Non-byte-aligned offsets use bits_to_words/words_to_bits.
+ *
+ * Architecture: BULK_CHUNK_BITS chunks with SM restart per chunk.
  * The RP1 DMA completion callback fails for slow SM programs
  * at larger transfer sizes, so each chunk is a complete PIO
  * transfer (count word + data). DMA config from init
  * (DMA_BUF_SIZE=4096) is reused — no per-chunk config_xfer.
- *
- * Performance: ~109 µs/chunk at clkdiv=5 (10 MHz TCK).
- * For a 3.8 MB bitstream: ~29,890 chunks × 109 µs ≈ 3.26 s
- * (vs 6.3 s with the two-SM chunked path).
  */
 static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
                            bool tms_value, const uint8_t *tdi,
-                           uint8_t *tdo)
+                           uint8_t *tdo, uint32_t start_bit)
 {
     PIO pio = (PIO)jtag->pio;
     uint sm0 = (uint)jtag->sm0;
     uint sm1 = (uint)jtag->sm1;
     int ret = 0;
 
-    /* Disable both SMs. SM0 may be stalled from a previous shift,
-     * SM1 must be stopped so it doesn't drive TMS. */
+    /* Disable SM0 (may be stalled from a previous shift).
+     * SM1 is never enabled — no need to disable it. */
     pio_sm_set_enabled(pio, sm0, false);
-    pio_sm_set_enabled(pio, sm1, false);
 
-    /* Set TMS as constant GPIO output.
-     * pio_sm_set_pins_with_mask temporarily reconfigures the SM's
-     * set pin group to drive the target pin directly. SM1 will
-     * override this when re-enabled in the next chunked shift. */
+    /* Set TMS as constant GPIO output via SM1.
+     * SM1 has output enable (OE) for the TMS pin, set during init.
+     * set_pins_with_mask works on a disabled SM. */
     uint32_t tms_mask = 1u << jtag->pins.tms;
     uint32_t tms_val = tms_value ? tms_mask : 0;
-    pio_sm_set_pins_with_mask(pio, sm0, tms_val, tms_mask);
+    pio_sm_set_pins_with_mask(pio, sm1, tms_val, tms_mask);
 
     /* Allocate buffers for max chunk size (BULK_CHUNK_BITS = 1024 bits).
      * TX: 1 count word + 32 data words = 132 bytes.
@@ -464,26 +294,34 @@ static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
         if (chunk_tx_bytes < MIN_DMA_BYTES) chunk_tx_bytes = MIN_DMA_BYTES;
         if (chunk_rx_bytes < MIN_DMA_BYTES) chunk_rx_bytes = MIN_DMA_BYTES;
 
-        /* Pack TX: count word + TDI data.
-         * On little-endian ARM64, byte layout of uint8_t[] bit vectors
-         * (LSB-first) matches byte layout of uint32_t[] words, so
-         * memcpy works for byte-aligned data. */
+        /* Pack TX: count word + TDI data */
         memset(tx_buf, 0, chunk_tx_bytes);
         tx_buf[0] = chunk_bits - 1;  /* count word */
 
-        uint32_t byte_off = bit_offset / 8;
-        uint32_t full_words = chunk_bits / 32;
-        if (full_words > 0)
-            memcpy(&tx_buf[1], tdi + byte_off, full_words * 4);
-        if (chunk_bits % 32) {
-            uint32_t last_word = 0;
-            uint32_t remaining_bits = chunk_bits % 32;
-            uint32_t remaining_bytes = (remaining_bits + 7) / 8;
-            memcpy(&last_word, tdi + byte_off + full_words * 4,
-                   remaining_bytes);
-            last_word &= (1u << remaining_bits) - 1;
-            tx_buf[1 + full_words] = last_word;
+        uint32_t abs_bit = start_bit + bit_offset;
+
+        if (abs_bit % 8 == 0) {
+            /* Byte-aligned: use memcpy (fast path).
+             * On little-endian ARM64, byte layout of uint8_t[] bit vectors
+             * (LSB-first) matches byte layout of uint32_t[] words. */
+            uint32_t byte_off = abs_bit / 8;
+            uint32_t full_words = chunk_bits / 32;
+            if (full_words > 0)
+                memcpy(&tx_buf[1], tdi + byte_off, full_words * 4);
+            if (chunk_bits % 32) {
+                uint32_t last_word = 0;
+                uint32_t remaining_bits = chunk_bits % 32;
+                uint32_t remaining_bytes = (remaining_bits + 7) / 8;
+                memcpy(&last_word, tdi + byte_off + full_words * 4,
+                       remaining_bytes);
+                last_word &= (1u << remaining_bits) - 1;
+                tx_buf[1 + full_words] = last_word;
+            }
+        } else {
+            /* Non-byte-aligned: use bits_to_words (correct for any offset) */
+            bits_to_words(tdi, abs_bit, chunk_bits, &tx_buf[1]);
         }
+
         memset(rx_buf, 0, chunk_rx_bytes);
 
         /* SM restart per chunk (proven pattern: disable → restart →
@@ -494,7 +332,7 @@ static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
         pio_sm_exec(pio, sm0, pio_encode_jmp(jtag->offset0));
         pio_sm_set_enabled(pio, sm0, true);
 
-        /* Launch concurrent TX/RX DMA (same as chunked path) */
+        /* Launch concurrent TX/RX DMA */
         xfer_args_t tx_args = {pio, sm0, PIO_DIR_TO_SM,
                                chunk_tx_bytes, tx_buf, 0, 0};
         xfer_args_t rx_args = {pio, sm0, PIO_DIR_FROM_SM,
@@ -507,9 +345,9 @@ static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
         pthread_join(t_rx, NULL);
 
         if (tx_args.ret < 0 || rx_args.ret < 0) {
-            fprintf(stderr, "rp1_jtag: bulk DMA chunk failed at bit %u "
+            fprintf(stderr, "rp1_jtag: DMA chunk failed at bit %u "
                     "(tx=%d[%s], rx=%d[%s])\n",
-                    bit_offset,
+                    abs_bit,
                     tx_args.ret, strerror(tx_args.err),
                     rx_args.ret, strerror(rx_args.err));
             ret = RP1_JTAG_ERR_IO;
@@ -526,15 +364,24 @@ static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
             }
         }
 
-        /* Unpack TDO using memcpy (same LE ARM64 optimization) */
+        /* Unpack TDO */
         if (tdo) {
-            if (full_words > 0)
-                memcpy(tdo + byte_off, rx_buf, full_words * 4);
-            if (chunk_bits % 32) {
-                uint32_t remaining_bits = chunk_bits % 32;
-                uint32_t remaining_bytes = (remaining_bits + 7) / 8;
-                memcpy(tdo + byte_off + full_words * 4,
-                       &rx_buf[full_words], remaining_bytes);
+            if (abs_bit % 8 == 0) {
+                /* Byte-aligned: use memcpy (fast path) */
+                uint32_t byte_off = abs_bit / 8;
+                uint32_t full_words = chunk_bits / 32;
+                if (full_words > 0)
+                    memcpy(tdo + byte_off, rx_buf, full_words * 4);
+                if (chunk_bits % 32) {
+                    uint32_t remaining_bits = chunk_bits % 32;
+                    uint32_t remaining_bytes = (remaining_bits + 7) / 8;
+                    memcpy(tdo + byte_off + full_words * 4,
+                           &rx_buf[full_words], remaining_bytes);
+                }
+            } else {
+                /* Non-byte-aligned: use words_to_bits */
+                words_to_bits(rx_buf, chunk_data_words,
+                              tdo, abs_bit, chunk_bits);
             }
         }
 
@@ -597,20 +444,12 @@ rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
         return NULL;
     }
 
-    /* Load PIO programs into instruction memory */
+    /* Load jtag_shift program into instruction memory.
+     * Only SM0 needs a PIO program; SM1 is used only for TMS
+     * pin output via set_pins_with_mask (no program needed). */
     uint offset0 = pio_add_program(pio, &jtag_shift_program);
     if (offset0 == PIO_ORIGIN_INVALID) {
         fprintf(stderr, "rp1_jtag: failed to load jtag_shift program\n");
-        pio_sm_unclaim(pio, (uint)sm1);
-        pio_sm_unclaim(pio, (uint)sm0);
-        pio_close(pio);
-        return NULL;
-    }
-
-    uint offset1 = pio_add_program(pio, &jtag_tms_program);
-    if (offset1 == PIO_ORIGIN_INVALID) {
-        fprintf(stderr, "rp1_jtag: failed to load jtag_tms program\n");
-        pio_remove_program(pio, &jtag_shift_program, offset0);
         pio_sm_unclaim(pio, (uint)sm1);
         pio_sm_unclaim(pio, (uint)sm0);
         pio_close(pio);
@@ -639,38 +478,29 @@ rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
     pio_sm_set_consecutive_pindirs(pio, (uint)sm0, pins->tdi, 1, true);   /* TDI output */
     pio_sm_set_consecutive_pindirs(pio, (uint)sm0, pins->tdo, 1, false);  /* TDO input */
 
-    /* Configure SM1: TMS (jtag_tms program)
+    /* Configure SM1: TMS output only (no program, no DMA).
      *
-     * LIMITATION: The jtag_tms program has GPIO4 hardcoded in its wait
-     * instructions (wait 0 gpio 4 / wait 1 gpio 4) to synchronize with
-     * SM0's TCK. If TCK is not on GPIO4, the wait instructions would need
-     * to be patched at runtime. For NeTV2 (TCK=GPIO4), this works as-is. */
-    pio_sm_config c1 = jtag_tms_program_get_default_config(offset1);
+     * SM1 is used solely for its output enable (OE) on the TMS pin.
+     * TMS is driven as a constant GPIO output via set_pins_with_mask,
+     * which works on a disabled SM. No PIO program is needed. */
+    pio_sm_config c1 = pio_get_default_sm_config();
     sm_config_set_out_pins(&c1, pins->tms, 1);
-    sm_config_set_out_shift(&c1, true, true, 32);   /* right shift, autopull at 32 */
-    sm_config_set_fifo_join(&c1, PIO_FIFO_JOIN_TX); /* TX-only FIFO (8 words) */
-    sm_config_set_clkdiv(&c1, div0);                /* same clock as SM0 */
-    pio_sm_init(pio, (uint)sm1, offset1, &c1);
+    pio_sm_init(pio, (uint)sm1, 0, &c1);
 
     /* Set pin direction for SM1 */
     pio_gpio_init(pio, pins->tms);
     pio_sm_set_consecutive_pindirs(pio, (uint)sm1, pins->tms, 1, true);   /* TMS output */
 
-    /* Configure DMA bounce buffers for all channels (once at init).
+    /* Configure DMA bounce buffers for SM0 (once at init).
      *
      * buf_size=DMA_BUF_SIZE (4096) matches the kernel's
      * DMA_BOUNCE_BUFFER_SIZE. Actual transfer sizes in xfer_data
-     * can be smaller. Both the chunked and bulk paths reuse this
-     * config without per-chunk config_xfer calls.
-     *
-     * NOTE: SM1 TX DMA has a size limit (~88 bytes / 22 words) beyond
-     * which it times out. Chunk sizes in rp1_jtag_shift are set to stay
-     * within this limit via MAX_CHUNK_BITS. */
+     * can be smaller. The bulk path reuses this config without
+     * per-chunk config_xfer calls. */
     int dma_ret;
     dma_ret = pio_sm_config_xfer(pio, (uint)sm0, PIO_DIR_TO_SM, DMA_BUF_SIZE, 1);
     if (dma_ret < 0) {
         fprintf(stderr, "rp1_jtag: config_xfer sm0 TX failed: %d\n", dma_ret);
-        pio_remove_program(pio, &jtag_tms_program, offset1);
         pio_remove_program(pio, &jtag_shift_program, offset0);
         pio_sm_unclaim(pio, (uint)sm1);
         pio_sm_unclaim(pio, (uint)sm0);
@@ -680,20 +510,6 @@ rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
     dma_ret = pio_sm_config_xfer(pio, (uint)sm0, PIO_DIR_FROM_SM, DMA_BUF_SIZE, 1);
     if (dma_ret < 0) {
         fprintf(stderr, "rp1_jtag: config_xfer sm0 RX failed: %d\n", dma_ret);
-        pio_remove_program(pio, &jtag_tms_program, offset1);
-        pio_remove_program(pio, &jtag_shift_program, offset0);
-        pio_sm_unclaim(pio, (uint)sm1);
-        pio_sm_unclaim(pio, (uint)sm0);
-        pio_close(pio);
-        return NULL;
-    }
-    /* SM1 TX DMA: Use 256-byte buffer (enough for MAX_CHUNK_BITS=640
-     * which needs 20 words = 80 bytes). Larger buffers cause DMA timeout
-     * in the kernel driver's bounce buffer setup. */
-    dma_ret = pio_sm_config_xfer(pio, (uint)sm1, PIO_DIR_TO_SM, 256, 1);
-    if (dma_ret < 0) {
-        fprintf(stderr, "rp1_jtag: config_xfer sm1 TX failed: %d\n", dma_ret);
-        pio_remove_program(pio, &jtag_tms_program, offset1);
         pio_remove_program(pio, &jtag_shift_program, offset0);
         pio_sm_unclaim(pio, (uint)sm1);
         pio_sm_unclaim(pio, (uint)sm0);
@@ -704,7 +520,6 @@ rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
     /* Allocate and fill context */
     rp1_jtag_t *jtag = calloc(1, sizeof(rp1_jtag_t));
     if (!jtag) {
-        pio_remove_program(pio, &jtag_tms_program, offset1);
         pio_remove_program(pio, &jtag_shift_program, offset0);
         pio_sm_unclaim(pio, (uint)sm1);
         pio_sm_unclaim(pio, (uint)sm0);
@@ -719,7 +534,7 @@ rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
     jtag->sm0 = sm0;
     jtag->sm1 = sm1;
     jtag->offset0 = offset0;
-    jtag->offset1 = offset1;
+    jtag->offset1 = 0;  /* no TMS program loaded */
 
     return jtag;
 }
@@ -801,7 +616,6 @@ void rp1_jtag_close(rp1_jtag_t *jtag)
 
     /* Remove programs from instruction memory */
     if (jtag->mode == MODE_JTAG) {
-        pio_remove_program(pio, &jtag_tms_program, jtag->offset1);
         pio_remove_program(pio, &jtag_shift_program, jtag->offset0);
     } else {
         pio_remove_program(pio, &jtag_loopback_program, jtag->offset0);
@@ -861,61 +675,54 @@ int rp1_jtag_shift(rp1_jtag_t *jtag, uint32_t num_bits,
         if (!tms)
             return RP1_JTAG_ERR_PARAM;
 
-        /* Check if TMS is constant (all same value) for the bulk path.
-         * Scan TMS bytes: if all full bytes match and the last partial
-         * byte matches in its used bits, TMS is constant. This is fast
-         * (~0.5 us for 3.8 MB on ARM64). */
-        bool tms_is_constant = false;
-        bool tms_value = false;
+        /* Split TMS into constant-value runs and dispatch each to
+         * jtag_shift_bulk() (SM0-only DMA with TMS via GPIO).
+         *
+         * TMS is set as a constant GPIO output via SM1's
+         * set_pins_with_mask before each SM0 DMA transfer.
+         *
+         * Fast path: for constant TMS (common case for bitstream
+         * programming), the byte-level scan below finds a single
+         * run and dispatches one call to jtag_shift_bulk(). */
 
-        if (num_bits >= BULK_THRESHOLD) {
-            uint32_t tms_full_bytes = num_bits / 8;
-            uint8_t expected = (tms[0] & 1) ? 0xFF : 0x00;
-
-            tms_is_constant = true;
-            for (uint32_t i = 0; i < tms_full_bytes; i++) {
-                if (tms[i] != expected) {
-                    tms_is_constant = false;
-                    break;
-                }
+        /* Byte-level scan for constant TMS (fast path) */
+        uint8_t first_byte = (tms[0] & 1) ? 0xFF : 0x00;
+        bool all_same = true;
+        uint32_t full_bytes = num_bits / 8;
+        for (uint32_t i = 0; i < full_bytes; i++) {
+            if (tms[i] != first_byte) {
+                all_same = false;
+                break;
             }
-
-            /* Check last partial byte (only the used bits) */
-            if (tms_is_constant && (num_bits % 8 != 0)) {
-                uint8_t mask = (1u << (num_bits % 8)) - 1;
-                if ((tms[tms_full_bytes] & mask) != (expected & mask))
-                    tms_is_constant = false;
-            }
-
-            if (tms_is_constant)
-                tms_value = (expected != 0);
+        }
+        if (all_same && (num_bits % 8) != 0) {
+            uint8_t mask = (1u << (num_bits % 8)) - 1;
+            if ((tms[full_bytes] & mask) != (first_byte & mask))
+                all_same = false;
         }
 
-        /* Constant TMS + enough bits: use single-SM bulk DMA path.
-         * This eliminates SM1 and its 704-bit chunk limit, using
-         * 1024-bit chunks without SM1 (~60,000 ioctls vs ~478,000
-         * and without the SM1 TX DMA size constraint). */
-        if (tms_is_constant)
-            return jtag_shift_bulk(jtag, num_bits, tms_value, tdi, tdo);
+        if (all_same) {
+            /* Constant TMS: single call */
+            return jtag_shift_bulk(jtag, num_bits, first_byte != 0,
+                                   tdi, tdo, 0);
+        }
 
-        /* Variable TMS or short transfer: use two-SM chunked path.
-         * Each chunk is a complete PIO transfer with its own count word.
-         * Chunks are at 32-bit word boundaries so byte pointer arithmetic
-         * stays aligned. */
-        uint32_t offset = 0;
-        while (offset < num_bits) {
-            uint32_t chunk = num_bits - offset;
-            if (chunk > MAX_CHUNK_BITS)
-                chunk = MAX_CHUNK_BITS;
+        /* Variable TMS: split into constant-value runs.
+         * Bit-level scanning is used for the (typically small)
+         * variable-TMS case (TAP navigation, < 100 bits). */
+        uint32_t pos = 0;
+        while (pos < num_bits) {
+            bool run_tms = bit_get(tms, pos);
+            uint32_t run_start = pos;
+            pos++;
+            while (pos < num_bits && bit_get(tms, pos) == run_tms)
+                pos++;
+            uint32_t run_bits = pos - run_start;
 
-            uint32_t byte_off = offset / 8;
-            int rc = jtag_shift_dma(jtag, chunk,
-                                     tms + byte_off,
-                                     tdi + byte_off,
-                                     tdo ? tdo + byte_off : NULL);
+            int rc = jtag_shift_bulk(jtag, run_bits, run_tms,
+                                     tdi, tdo, run_start);
             if (rc < 0)
                 return rc;
-            offset += chunk;
         }
         return 0;
     } else {
