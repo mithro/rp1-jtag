@@ -34,6 +34,19 @@
 /* PIO instructions per JTAG bit (jtag_shift program: 4 instruction loop) */
 #define INSTR_PER_BIT           4
 
+/* Maximum bits per DMA transfer chunk.
+ *
+ * Limited by SM1 TX DMA: the RP1 PIO kernel driver's DMA path for SM1 TX
+ * times out for transfers exceeding ~22-23 words. With PIO_FIFO_JOIN_TX
+ * on SM1, the limit is ~23 words (736 bits). SM1 TX carries ceil(N/32)
+ * words of TMS data per chunk.
+ *
+ * MAX_CHUNK_BITS = 704 gives SM1 TX = 22 words = 88 bytes, just at the
+ * known working limit without FIFO join and safely under with join.
+ *
+ * Must be a multiple of BITS_PER_WORD (32) for word-aligned chunking. */
+#define MAX_CHUNK_BITS          704
+
 /* Operating mode */
 typedef enum {
     MODE_JTAG,      /* Normal JTAG mode: two SMs, GPIO pins */

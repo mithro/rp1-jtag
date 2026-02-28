@@ -125,14 +125,15 @@ static void *xfer_thread(void *arg)
     return NULL;
 }
 
+
 /* ---- Core JTAG shift via DMA (two SMs) ---- */
 
 /*
  * Shift num_bits through JTAG using DMA with SM0 (TDI/TDO/TCK) and
- * SM1 (TMS). Three concurrent pthreads handle:
- *   - SM0 TX: count word + TDI data
- *   - SM0 RX: TDO data
- *   - SM1 TX: TMS data
+ * SM1 (TMS). DMA transfers run concurrently:
+ *   - SM1 TX: TMS data (background thread, started first)
+ *   - SM0 RX: TDO data (background thread)
+ *   - SM0 TX: count word + TDI data (calling thread)
  */
 static int jtag_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
                            const uint8_t *tms, const uint8_t *tdi,
@@ -143,7 +144,7 @@ static int jtag_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
     uint sm1 = (uint)jtag->sm1;
     int ret = 0;
 
-    /* Reset both SMs to program start with clean FIFOs.
+    /* Reset both SMs to program start with clean shift counters.
      *
      * After a previous shift, SM1 may be stalled mid-program
      * (at `wait 1 gpio 4` instead of program start). Without
@@ -152,14 +153,16 @@ static int jtag_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
      *
      * pio_sm_restart() clears shift counters (ISR/OSR count = 0),
      * which triggers autopull on SM1's first `out pins, 1`,
-     * correctly loading fresh TMS data from the FIFO. */
+     * correctly loading fresh TMS data from the FIFO.
+     *
+     * clear_fifos is not needed: FIFOs are empty after a completed
+     * DMA transfer (all data consumed by SM / read by DMA).
+     * pio_select is not needed: only used by sm_config_set_*
+     * functions, not by pio_sm_exec or pio_sm_restart. */
     pio_sm_set_enabled(pio, sm0, false);
     pio_sm_set_enabled(pio, sm1, false);
-    pio_sm_clear_fifos(pio, sm0);
-    pio_sm_clear_fifos(pio, sm1);
     pio_sm_restart(pio, sm0);
     pio_sm_restart(pio, sm1);
-    pio_select(pio);
     pio_sm_exec(pio, sm0, pio_encode_jmp(jtag->offset0));
     pio_sm_exec(pio, sm1, pio_encode_jmp(jtag->offset1));
 
@@ -206,62 +209,54 @@ static int jtag_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
     bits_to_words(tms, 0, num_bits, sm1_tx);         /* TMS data */
     memset(sm0_rx, 0, sm0_rx_dma);                   /* clear RX buffer */
 
-    /* Configure DMA channels */
-    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, sm0_tx_dma, 1);
-    if (ret < 0) goto cleanup;
-    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM, sm0_rx_dma, 1);
-    if (ret < 0) goto cleanup;
-    ret = pio_sm_config_xfer(pio, sm1, PIO_DIR_TO_SM, sm1_tx_dma, 1);
-    if (ret < 0) goto cleanup;
-
-    /* NOTE: Do NOT call pio_sm_set_dmactrl() here. The kernel driver
-     * (PR #7190) already sets correct FIFO thresholds in config_xfer.
-     * Manually overriding with 0xC0000108 breaks RX DMA on newer kernels
-     * (causes ETIMEDOUT for transfers >= 128 bytes). */
+    /* NOTE: DMA channels are configured once during init via
+     * pio_sm_config_xfer(). Per-shift transfers use xfer_data only. */
 
     /* Enable both state machines */
     pio_sm_set_enabled(pio, sm0, true);
     pio_sm_set_enabled(pio, sm1, true);
 
-    /* Launch 3 concurrent DMA threads.
+    /* Launch DMA transfers: 2 threads + calling thread.
      *
-     * ORDERING: SM1 TX (TMS) MUST start before SM0 TX (TDI/TCK).
+     * ORDERING: SM1 TX (TMS) must start before SM0 TX (TDI/TCK).
      *
      * At this point both SMs are enabled but stalled:
      *   SM0: stalled on `pull side 0` (TX FIFO empty, TCK held LOW)
      *   SM1: passed `wait 0 gpio 4` (TCK is LOW), stalled on `out pins, 1`
      *        (TX FIFO empty, autopull blocks)
      *
-     * Starting SM1 TX DMA first fills SM1's FIFO. SM1 then outputs TMS
-     * bit 0 and stalls on `wait 1 gpio 4` (TCK still LOW). The usleep
-     * ensures the kernel has time to start SM1's DMA before SM0's DMA
-     * delivers data and SM0 begins clocking TCK.
-     *
-     * Without this ordering, SM0 could clock 1000+ bits before SM1 gets
-     * its first DMA word, causing TMS to be misaligned with TDI/TCK. */
+     * SM1 TX and SM0 RX run as background threads. SM0 TX runs on
+     * the calling thread. Thread creation gives SM1 TX a head start:
+     * by the time SM0 TX calls xfer_data (~50-100 µs later, after
+     * creating both threads), SM1's DMA is already being set up in
+     * the kernel. This replaces the previous usleep(500) and also
+     * eliminates one pthread_create/join pair. */
     xfer_args_t tx1 = {pio, sm1, PIO_DIR_TO_SM,   sm1_tx_dma, sm1_tx, 0, 0};
-    xfer_args_t tx0 = {pio, sm0, PIO_DIR_TO_SM,   sm0_tx_dma, sm0_tx, 0, 0};
     xfer_args_t rx0 = {pio, sm0, PIO_DIR_FROM_SM, sm0_rx_dma, sm0_rx, 0, 0};
 
-    pthread_t t_tx1, t_tx0, t_rx0;
+    pthread_t t_tx1, t_rx0;
     pthread_create(&t_tx1, NULL, xfer_thread, &tx1);  /* SM1 TX first (TMS) */
-    usleep(500);  /* Let kernel start SM1 DMA before SM0 clocks */
-    pthread_create(&t_tx0, NULL, xfer_thread, &tx0);  /* SM0 TX (count + TDI) */
     pthread_create(&t_rx0, NULL, xfer_thread, &rx0);  /* SM0 RX (TDO) */
 
+    /* SM0 TX on calling thread — SM1 TX thread has head start from
+     * the time spent creating both threads above. */
+    int tx0_ret, tx0_err;
+    errno = 0;
+    tx0_ret = pio_sm_xfer_data(pio, sm0, PIO_DIR_TO_SM, sm0_tx_dma, sm0_tx);
+    tx0_err = errno;
+
     pthread_join(t_tx1, NULL);
-    pthread_join(t_tx0, NULL);
     pthread_join(t_rx0, NULL);
 
-    /* Disable both state machines */
-    pio_sm_set_enabled(pio, sm1, false);
-    pio_sm_set_enabled(pio, sm0, false);
+    /* SMs are left enabled but stalled (SM0 at `pull side 0`,
+     * SM1 at `out pins, 1` waiting for autopull). Next call's
+     * reset handles disable, and rp1_jtag_close() cleans up. */
 
     /* Check for DMA errors */
-    if (tx0.ret < 0 || rx0.ret < 0 || tx1.ret < 0) {
+    if (tx0_ret < 0 || rx0.ret < 0 || tx1.ret < 0) {
         fprintf(stderr, "rp1_jtag: DMA transfer failed "
                 "(tx0=%d[%s], rx0=%d[%s], tx1=%d[%s])\n",
-                tx0.ret, strerror(tx0.err),
+                tx0_ret, strerror(tx0_err),
                 rx0.ret, strerror(rx0.err),
                 tx1.ret, strerror(tx1.err));
         ret = RP1_JTAG_ERR_IO;
@@ -484,12 +479,57 @@ rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
     pio_sm_config c1 = jtag_tms_program_get_default_config(offset1);
     sm_config_set_out_pins(&c1, pins->tms, 1);
     sm_config_set_out_shift(&c1, true, true, 32);   /* right shift, autopull at 32 */
+    sm_config_set_fifo_join(&c1, PIO_FIFO_JOIN_TX); /* TX-only FIFO (8 words) */
     sm_config_set_clkdiv(&c1, div0);                /* same clock as SM0 */
     pio_sm_init(pio, (uint)sm1, offset1, &c1);
 
     /* Set pin direction for SM1 */
     pio_gpio_init(pio, pins->tms);
     pio_sm_set_consecutive_pindirs(pio, (uint)sm1, pins->tms, 1, true);   /* TMS output */
+
+    /* Configure DMA bounce buffers for all channels (once at init).
+     *
+     * buf_size=4096 matches the kernel's DMA_BOUNCE_BUFFER_SIZE.
+     * Actual transfer sizes in xfer_data can be smaller.
+     *
+     * NOTE: SM1 TX DMA has a size limit (~88 bytes / 22 words) beyond
+     * which it times out. Chunk sizes in rp1_jtag_shift are set to stay
+     * within this limit via MAX_CHUNK_BITS. */
+    #define DMA_BUF_SIZE 4096
+    int dma_ret;
+    dma_ret = pio_sm_config_xfer(pio, (uint)sm0, PIO_DIR_TO_SM, DMA_BUF_SIZE, 1);
+    if (dma_ret < 0) {
+        fprintf(stderr, "rp1_jtag: config_xfer sm0 TX failed: %d\n", dma_ret);
+        pio_remove_program(pio, &jtag_tms_program, offset1);
+        pio_remove_program(pio, &jtag_shift_program, offset0);
+        pio_sm_unclaim(pio, (uint)sm1);
+        pio_sm_unclaim(pio, (uint)sm0);
+        pio_close(pio);
+        return NULL;
+    }
+    dma_ret = pio_sm_config_xfer(pio, (uint)sm0, PIO_DIR_FROM_SM, DMA_BUF_SIZE, 1);
+    if (dma_ret < 0) {
+        fprintf(stderr, "rp1_jtag: config_xfer sm0 RX failed: %d\n", dma_ret);
+        pio_remove_program(pio, &jtag_tms_program, offset1);
+        pio_remove_program(pio, &jtag_shift_program, offset0);
+        pio_sm_unclaim(pio, (uint)sm1);
+        pio_sm_unclaim(pio, (uint)sm0);
+        pio_close(pio);
+        return NULL;
+    }
+    /* SM1 TX DMA: Use 256-byte buffer (enough for MAX_CHUNK_BITS=640
+     * which needs 20 words = 80 bytes). Larger buffers cause DMA timeout
+     * in the kernel driver's bounce buffer setup. */
+    dma_ret = pio_sm_config_xfer(pio, (uint)sm1, PIO_DIR_TO_SM, 256, 1);
+    if (dma_ret < 0) {
+        fprintf(stderr, "rp1_jtag: config_xfer sm1 TX failed: %d\n", dma_ret);
+        pio_remove_program(pio, &jtag_tms_program, offset1);
+        pio_remove_program(pio, &jtag_shift_program, offset0);
+        pio_sm_unclaim(pio, (uint)sm1);
+        pio_sm_unclaim(pio, (uint)sm0);
+        pio_close(pio);
+        return NULL;
+    }
 
     /* Allocate and fill context */
     rp1_jtag_t *jtag = calloc(1, sizeof(rp1_jtag_t));
@@ -650,7 +690,28 @@ int rp1_jtag_shift(rp1_jtag_t *jtag, uint32_t num_bits,
     if (jtag->mode == MODE_JTAG) {
         if (!tms)
             return RP1_JTAG_ERR_PARAM;
-        return jtag_shift_dma(jtag, num_bits, tms, tdi, tdo);
+
+        /* Chunk large transfers to stay within PIOLib's DMA timeout.
+         * Each chunk is a complete PIO transfer with its own count word.
+         * Chunks are at 32-bit word boundaries so byte pointer arithmetic
+         * stays aligned. The JTAG TAP state is maintained between chunks
+         * (TMS is passed through per-bit, not modified by chunking). */
+        uint32_t offset = 0;
+        while (offset < num_bits) {
+            uint32_t chunk = num_bits - offset;
+            if (chunk > MAX_CHUNK_BITS)
+                chunk = MAX_CHUNK_BITS;
+
+            uint32_t byte_off = offset / 8;
+            int rc = jtag_shift_dma(jtag, chunk,
+                                     tms + byte_off,
+                                     tdi + byte_off,
+                                     tdo ? tdo + byte_off : NULL);
+            if (rc < 0)
+                return rc;
+            offset += chunk;
+        }
+        return 0;
     } else {
         return loopback_shift_dma(jtag, num_bits, tdi, tdo);
     }
