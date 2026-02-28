@@ -57,3 +57,4 @@ sudo ./build/tests/hardware/test_idcode            # Needs NeTV2
 
 TCK=GPIO4, TMS=GPIO17, TDI=GPIO27, TDO=GPIO22
 FPGA: Xilinx Artix-7 XC7A100T, IDCODE 0x13631093
+FPGA: Xilinx Artix-7 XC7A35T, IDCODE 0x0362D093
