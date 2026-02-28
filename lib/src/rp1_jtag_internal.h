@@ -47,11 +47,18 @@
  * Must be a multiple of BITS_PER_WORD (32) for word-aligned chunking. */
 #define MAX_CHUNK_BITS          704
 
-/* Bulk DMA transfer buffer size (256 KB, matching benchmark config).
- * Used for single-SM transfers when TMS is constant (e.g., bitstream
- * programming in Shift-DR state). Each pio_sm_xfer_data() call
- * transfers up to this many bytes per chunk. */
-#define BULK_DMA_SIZE           (256 * 1024)
+/* Maximum bits per bulk DMA chunk (single-SM, constant TMS path).
+ *
+ * The RP1 PIO kernel driver's DMA completion callback fails for
+ * transfers exceeding ~1024 bits on slow SM programs (4 instr/bit).
+ * Workaround: chunk into 1024-bit transfers with SM restart between
+ * each. DMA config from init (DMA_BUF_SIZE=4096) is reused.
+ *
+ * Each chunk: 1 count word + 32 TDI words = 132 bytes TX,
+ *             33 RX words = 132 bytes. Both well within DMA_BUF_SIZE.
+ *
+ * Must be a multiple of BITS_PER_WORD (32). */
+#define BULK_CHUNK_BITS         1024
 
 /* Minimum bit count for bulk DMA path.
  * Below this threshold, the chunked two-SM path is used even for
