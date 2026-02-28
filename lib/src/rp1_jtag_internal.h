@@ -47,6 +47,18 @@
  * Must be a multiple of BITS_PER_WORD (32) for word-aligned chunking. */
 #define MAX_CHUNK_BITS          704
 
+/* Bulk DMA transfer buffer size (256 KB, matching benchmark config).
+ * Used for single-SM transfers when TMS is constant (e.g., bitstream
+ * programming in Shift-DR state). Each pio_sm_xfer_data() call
+ * transfers up to this many bytes per chunk. */
+#define BULK_DMA_SIZE           (256 * 1024)
+
+/* Minimum bit count for bulk DMA path.
+ * Below this threshold, the chunked two-SM path is used even for
+ * constant TMS. Must be > BITS_PER_WORD to ensure at least one
+ * DMA word. */
+#define BULK_THRESHOLD          1024
+
 /* Operating mode */
 typedef enum {
     MODE_JTAG,      /* Normal JTAG mode: two SMs, GPIO pins */
