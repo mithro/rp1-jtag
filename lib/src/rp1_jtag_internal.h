@@ -57,7 +57,7 @@
  * Below this threshold, the chunked two-SM path is used even for
  * constant TMS. Must be > BITS_PER_WORD to ensure at least one
  * DMA word. */
-#define BULK_THRESHOLD          1024
+#define BULK_THRESHOLD          999999999  /* TEMP: force chunked path for debugging */
 
 /* Operating mode */
 typedef enum {

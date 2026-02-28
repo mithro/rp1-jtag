@@ -131,14 +131,19 @@ static void *xfer_thread(void *arg)
 }
 
 /* Looping DMA thread (used by bulk path).
- * Splits total_bytes into BULK_DMA_SIZE chunks, ensuring no chunk
- * is smaller than MIN_DMA_BYTES (kernel minimum). */
+ * Splits total_bytes into chunk_size chunks, ensuring no chunk
+ * is smaller than MIN_DMA_BYTES (kernel minimum).
+ *
+ * IMPORTANT: chunk_size must equal the config_xfer buf_size.
+ * The RP1 kernel driver transfers exactly config_xfer bytes
+ * per DMA operation, so xfer_data size must match. */
 typedef struct {
     PIO pio;
     uint sm;
     enum pio_xfer_dir dir;
     uint8_t *buf;
     size_t total_bytes;
+    size_t chunk_size;  /* must match config_xfer buf_size */
     int ret;
     int err;
 } bulk_xfer_args_t;
@@ -152,8 +157,8 @@ static void *bulk_xfer_thread(void *arg)
 
     while (remaining > 0) {
         size_t chunk = remaining;
-        if (chunk > BULK_DMA_SIZE)
-            chunk = BULK_DMA_SIZE;
+        if (chunk > a->chunk_size)
+            chunk = a->chunk_size;
 
         /* If the next chunk would be smaller than MIN_DMA_BYTES,
          * shrink this chunk to leave at least MIN_DMA_BYTES for next. */
@@ -469,12 +474,6 @@ static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
     uint32_t tms_val = tms_value ? tms_mask : 0;
     pio_sm_set_pins_with_mask(pio, sm0, tms_val, tms_mask);
 
-    /* Reconfigure DMA for large buffers (256 KB) */
-    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, BULK_DMA_SIZE, 1);
-    if (ret < 0) { ret = RP1_JTAG_ERR_IO; goto restore; }
-    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM, BULK_DMA_SIZE, 1);
-    if (ret < 0) { ret = RP1_JTAG_ERR_IO; goto restore; }
-
     /* Reset SM0 and jump to program start */
     pio_sm_restart(pio, sm0);
     pio_sm_exec(pio, sm0, pio_encode_jmp(jtag->offset0));
@@ -513,31 +512,56 @@ static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
         tx_buf[1 + full_words] = last_word;
     }
 
-    /* Enable SM0 only (SM1 stays disabled — TMS is driven by GPIO) */
-    pio_sm_set_enabled(pio, sm0, true);
+    /* Configure DMA for exact transfer size (matching loopback path).
+     * The loopback path calls config_xfer with exact sizes before each
+     * transfer and works up to 256 KB. Use the same pattern here. */
+    size_t tx_dma_size = tx_total_bytes < MIN_DMA_BYTES ? MIN_DMA_BYTES : tx_total_bytes;
+    size_t rx_dma_size = rx_total_bytes < MIN_DMA_BYTES ? MIN_DMA_BYTES : rx_total_bytes;
 
-    /* Launch two concurrent DMA threads.
-     * TX sends count + TDI data, RX receives TDO data.
-     * Each thread loops over BULK_DMA_SIZE chunks.
-     * The SM autopull/autopush pipeline self-balances between them. */
-    bulk_xfer_args_t tx_args = {pio, sm0, PIO_DIR_TO_SM,
-                                (uint8_t *)tx_buf, tx_total_bytes, 0, 0};
-    bulk_xfer_args_t rx_args = {pio, sm0, PIO_DIR_FROM_SM,
-                                (uint8_t *)rx_buf, rx_total_bytes, 0, 0};
+    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, tx_dma_size, 1);
+    if (ret < 0) { ret = RP1_JTAG_ERR_IO; goto restore; }
+    ret = pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM, rx_dma_size, 1);
+    if (ret < 0) { ret = RP1_JTAG_ERR_IO; goto restore; }
+
+    /* Launch DMA threads BEFORE enabling SM0.
+     *
+     * Both TX and RX xfer_data ioctls must be armed in the kernel
+     * before the PIO state machine starts processing data. The PIO
+     * TX FIFO accepts data even when the SM is disabled (hardware
+     * behavior), so the TX DMA can fill the FIFO. The RX DMA is
+     * armed and waiting for FIFO data.
+     *
+     * Without this ordering, there is a race condition: the SM
+     * produces RX data faster than the RX DMA thread can set up
+     * (~3.2 us per word at 10 MHz TCK), filling the 4-word RX FIFO
+     * in ~12.8 us. If RX DMA isn't armed yet, the SM stalls on
+     * autopush, TX FIFO stops draining, and TX DMA times out. */
+    xfer_args_t tx0 = {pio, sm0, PIO_DIR_TO_SM,   tx_dma_size, tx_buf, 0, 0};
+    xfer_args_t rx0 = {pio, sm0, PIO_DIR_FROM_SM, rx_dma_size, rx_buf, 0, 0};
 
     pthread_t t_tx, t_rx;
-    pthread_create(&t_tx, NULL, bulk_xfer_thread, &tx_args);
-    pthread_create(&t_rx, NULL, bulk_xfer_thread, &rx_args);
+    pthread_create(&t_rx, NULL, xfer_thread, &rx0);
+    pthread_create(&t_tx, NULL, xfer_thread, &tx0);
+
+    /* Wait for both threads to enter their kernel ioctls and arm
+     * the DMA engines. pthread_create + ioctl entry takes ~50-100 us
+     * per thread; 1 ms provides a safe margin. The kernel DMA timeout
+     * is several seconds, so this delay is negligible. */
+    usleep(1000);
+
+    /* NOW enable SM0. Both DMAs are armed, so the pipeline runs
+     * without stalling: TX DMA → TX FIFO → SM0 → RX FIFO → RX DMA */
+    pio_sm_set_enabled(pio, sm0, true);
 
     pthread_join(t_tx, NULL);
     pthread_join(t_rx, NULL);
 
     /* Check for DMA errors */
-    if (tx_args.ret < 0 || rx_args.ret < 0) {
+    if (tx0.ret < 0 || rx0.ret < 0) {
         fprintf(stderr, "rp1_jtag: bulk DMA failed "
                 "(tx=%d[%s], rx=%d[%s])\n",
-                tx_args.ret, strerror(tx_args.err),
-                rx_args.ret, strerror(rx_args.err));
+                tx0.ret, strerror(tx0.err),
+                rx0.ret, strerror(rx0.err));
         ret = RP1_JTAG_ERR_IO;
         goto restore;
     }
@@ -566,11 +590,11 @@ static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
     ret = 0;
 
 restore:
-    free(tx_buf);
-    free(rx_buf);
-    /* Restore DMA config for chunked path */
+    /* Restore DMA config for chunked path (init-time sizes) */
     pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, DMA_BUF_SIZE, 1);
     pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM, DMA_BUF_SIZE, 1);
+    free(tx_buf);
+    free(rx_buf);
     return ret;
 }
 
