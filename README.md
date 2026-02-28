@@ -84,10 +84,11 @@ details on pin mapping, method mapping, and performance.
 
 ```bash
 # Using openFPGALoader with rp1pio cable (requires sudo for /dev/pio0)
+# Default pins are NeTV2 wiring (TCK=4, TMS=17, TDI=27, TDO=22)
 sudo openFPGALoader -c rp1pio --detect
 sudo openFPGALoader -c rp1pio bitstream.bit
 
-# With explicit pin configuration (NeTV2 wiring: TDI:TDO:TCK:TMS)
+# With explicit pin configuration (format: --pins TDI:TDO:TCK:TMS)
 sudo openFPGALoader -c rp1pio --pins 27:22:4:17 --detect
 
 # Using the library directly
