@@ -143,11 +143,39 @@ static int jtag_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
     uint sm1 = (uint)jtag->sm1;
     int ret = 0;
 
+    /* Reset both SMs to program start with clean FIFOs.
+     *
+     * After a previous shift, SM1 may be stalled mid-program
+     * (at `wait 1 gpio 4` instead of program start). Without
+     * resetting, SM1 misses the first TMS output on the next
+     * shift, causing TMS to be delayed by one bit.
+     *
+     * pio_sm_restart() clears shift counters (ISR/OSR count = 0),
+     * which triggers autopull on SM1's first `out pins, 1`,
+     * correctly loading fresh TMS data from the FIFO. */
+    pio_sm_set_enabled(pio, sm0, false);
+    pio_sm_set_enabled(pio, sm1, false);
+    pio_sm_clear_fifos(pio, sm0);
+    pio_sm_clear_fifos(pio, sm1);
+    pio_sm_restart(pio, sm0);
+    pio_sm_restart(pio, sm1);
+    pio_select(pio);
+    pio_sm_exec(pio, sm0, pio_encode_jmp(jtag->offset0));
+    pio_sm_exec(pio, sm1, pio_encode_jmp(jtag->offset1));
+
     /* Calculate buffer sizes.
+     *
+     * SM0 TX: 1 count word + ceil(N/32) TDI data words.
+     * SM0 RX: The PIO program produces floor(N/32) autopush words
+     *         plus 1 explicit push word = floor(N/32) + 1 total.
+     *         This differs from ceil(N/32) when N is a multiple of 32.
+     * SM1 TX: ceil(N/32) TMS data words (no count word).
+     *
      * Enforce MIN_DMA_BYTES since PIOLib can't DMA single words. */
     uint32_t num_data_words = bits_to_word_count(num_bits);
+    uint32_t sm0_rx_words = num_bits / BITS_PER_WORD + 1;  /* autopush + final push */
     size_t sm0_tx_bytes = (1 + num_data_words) * sizeof(uint32_t);  /* count + TDI */
-    size_t sm0_rx_bytes = num_data_words * sizeof(uint32_t);        /* TDO */
+    size_t sm0_rx_bytes = sm0_rx_words * sizeof(uint32_t);          /* TDO */
     size_t sm1_tx_bytes = num_data_words * sizeof(uint32_t);        /* TMS */
 
     /* DMA transfer sizes (padded to minimum) */
