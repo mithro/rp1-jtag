@@ -81,6 +81,22 @@ static int rp1_pio_state_move(enum tap_state goal)
 	uint8_t tdi_buf[2] = {0, 0};
 	enum tap_state cur = tap_get_state();
 
+	if (goal == TAP_RESET) {
+		/*
+		 * Always force a hardware TAP reset by clocking 5x TMS=1,
+		 * even if we think we're already in TLR.  This ensures the
+		 * physical TAP gets reset from any unknown state.
+		 */
+		tms_buf[0] = 0x1f; /* 5 bits of TMS=1 */
+		int ret = rp1_jtag_shift(rp1_dev, 5, tms_buf, tdi_buf, NULL);
+		if (ret < 0) {
+			LOG_ERROR("rp1_pio_jtag: TAP reset failed (%d)", ret);
+			return ERROR_FAIL;
+		}
+		tap_set_state(TAP_RESET);
+		return ERROR_OK;
+	}
+
 	if (cur == goal)
 		return ERROR_OK;
 
@@ -147,9 +163,26 @@ static int rp1_pio_handle_scan(struct scan_command *cmd)
 		return ERROR_FAIL;
 	}
 
-	/* After shifting with TMS=1 on last bit, TAP is in Exit1-xR */
-	enum tap_state exit_state = cmd->ir_scan ? TAP_IREXIT1 : TAP_DREXIT1;
-	tap_set_state(exit_state);
+	/* After shifting with TMS=1 on last bit, TAP is in Exit1-xR.
+	 * Exit1 is not a "stable" state, so we cannot use tap_get_tms_path()
+	 * directly.  Navigate to Run-Test/Idle via Update-xR first:
+	 *   Exit1-xR --(TMS=1)--> Update-xR --(TMS=0)--> Run-Test/Idle
+	 */
+	{
+		uint8_t post_tms[1] = {0x01}; /* bits: 1,0 = TMS high then low */
+		uint8_t post_tdi[1] = {0x00};
+		int post_ret = rp1_jtag_shift(rp1_dev, 2, post_tms, post_tdi,
+					      NULL);
+		if (post_ret < 0) {
+			LOG_ERROR("rp1_pio_jtag: post-scan nav failed (%d)",
+				  post_ret);
+			free(tdo);
+			free(tms);
+			free(tdi_buf);
+			return ERROR_FAIL;
+		}
+	}
+	tap_set_state(TAP_IDLE);
 
 	/* Copy TDO data back through OpenOCD's scan field machinery */
 	retval = jtag_read_buffer(tdo, cmd);

@@ -314,9 +314,20 @@ static int pio_shift_fast_chunk(rp1_jtag_t *jtag,
     /* Enable SM — fast program starts immediately, stalls on autopull */
     be->ops->sm_set_enabled(be, true);
 
-    /* Try DMA path first */
-    bool use_dma = (be->ops->xfer_data != NULL &&
-                    ensure_dma_configured(jtag) == 0);
+    /*
+     * DMA path disabled: RP1 PIOLib's sequential TX-then-RX DMA causes
+     * data corruption (only bit 31 of each word after word 0 is valid).
+     * Root cause: the blocking TX DMA write completes before the SM
+     * finishes producing all RX words; the subsequent RX DMA read then
+     * races with the SM, likely getting autopush words out of alignment.
+     *
+     * The FIFO interleaving path (word-by-word sm_put/sm_get) is correct
+     * and still much faster than the counted program for large transfers
+     * since it avoids the 5-instr count-word overhead.
+     *
+     * TODO: investigate DMA with non-blocking / interrupt-driven approach.
+     */
+    bool use_dma = false;
 
     if (use_dma) {
         /*
