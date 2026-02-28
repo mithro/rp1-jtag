@@ -29,13 +29,18 @@ cmake -DENABLE_RP1_PIO=ON -B openFPGALoader/build -S openFPGALoader
 cmake --build openFPGALoader/build
 
 # 5. Use (requires sudo for /dev/pio0 access)
+# Default pins are NeTV2 wiring (TCK=4, TMS=17, TDI=27, TDO=22)
+sudo openFPGALoader/build/openFPGALoader -c rp1pio --detect
+sudo openFPGALoader/build/openFPGALoader -c rp1pio bitstream.bit
+# Or with explicit pins (format: --pins TDI:TDO:TCK:TMS)
 sudo openFPGALoader/build/openFPGALoader -c rp1pio --pins 27:22:4:17 --detect
-sudo openFPGALoader/build/openFPGALoader -c rp1pio --pins 27:22:4:17 bitstream.bit
 ```
 
 ## Pin Format
 
 openFPGALoader's `--pins` takes positional colon-separated GPIO numbers: `TDI:TDO:TCK:TMS`
+
+If `--pins` is omitted, the driver defaults to NeTV2 wiring (TCK=4, TMS=17, TDI=27, TDO=22).
 
 For NeTV2 (TCK=4, TMS=17, TDI=27, TDO=22):
 ```
