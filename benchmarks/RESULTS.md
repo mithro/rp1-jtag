@@ -130,28 +130,59 @@ Eliminating the ioctl bottleneck requires kernel-level changes:
 - Or using separate PIO file descriptors (separate mutexes) for TX and RX
 - Or patching PIOLib to use finer-grained locking (per-direction, not per-SM)
 
+## RPi 5 — rp1-jtag bulk DMA (single-SM, constant TMS)
+
+Measured on 2026-02-28. Uses `test_single_shift` to test the bulk DMA path directly.
+
+- Single SM (SM0 only), TMS driven as constant GPIO output
+- 1024-bit chunks with SM restart per chunk, reusing init DMA config
+- Eliminates SM1 and its 704-bit chunk limit for constant-TMS transfers
+- Pins: TDI=27, TDO=22, TCK=4, TMS=17
+
+### 10 MHz (default, clkdiv=5)
+
+Test: `test_single_shift 30625904` (3.8 MB = XC7A100T bitstream size)
+
+| Run | Wall time | kB/s |
+|-----|-----------|------|
+| 1 | 3.62s | 1,034 |
+| 2 | 3.45s | 1,085 |
+
+- **Average: 3.54s, 1,058 kB/s** (1.80x faster than two-SM chunked at 6.36s)
+
+### Analysis
+
+The bulk path processes 30,625,904 bits in ~29,908 chunks of 1024 bits.
+At 10 MHz TCK: theoretical PIO processing time is 3.06s (30.6M bits / 10M Hz).
+Measured: 3.54s. Overhead: ~0.48s = ~16 µs/chunk (PIO processing overlaps with DMA setup).
+
+**RP1 DMA completion callback bug**: The kernel driver's DMA completion callback is never invoked for single-transfer sizes > ~1024 bits on slow SM programs (4 instr/bit at clkdiv >= 3). The DMA physically completes (proven by RX data) but the semaphore is never signaled, causing a 1-second timeout. Workaround: 1024-bit chunks with SM restart between each.
+
+**Reliable clkdiv range**: clkdiv >= 3 (16.67 MHz TCK and below). clkdiv=2 (25 MHz) fails after ~5,883 chunks. clkdiv=1.5 (33 MHz) fails after ~5,680 chunks. Higher TCK frequencies require kernel fixes for reliable DMA.
+
+**FPGA connectivity**: IDCODE test returns 0xFFFFFFFF during this session (NeTV2 not responding). Bitstream programming via openFPGALoader could not be tested. The bulk DMA path was verified using test_single_shift (constant TMS=0, TDO data not validated).
+
 ## Summary
 
 | Platform | Method | Bitstream | Time | Throughput | vs RPi 5 sysfsgpio |
 |----------|--------|-----------|------|------------|-------------------|
 | RPi 3B+ | OpenOCD bcm2835gpio | 2.1 MB (35T) | 1.5s | 1,428 kB/s | 15x |
+| RPi 5 | rp1-jtag bulk DMA @10MHz | 3.8 MB (100T) | 3.5s | 1,058 kB/s | 11x |
+| RPi 5 | rp1-jtag (two-SM chunked) | 3.8 MB (100T) | 6.3s | 589 kB/s | 6x |
 | RPi 5 | OpenOCD sysfsgpio | 3.8 MB (100T) | 39.0s | 96 kB/s | 1x (baseline) |
-| RPi 5 | rp1-jtag (before opt) | 3.8 MB (100T) | 6.5s | 572 kB/s | 6x |
-| RPi 5 | rp1-jtag (after opt) | 3.8 MB (100T) | 6.2s | 603 kB/s | 6.3x |
-| RPi 5 | rp1-jtag (bidi DMA) | 3.8 MB (100T) | — | BLOCKED | kernel mutex |
 
 ### Key observations
 
 1. **RPi 5 sysfsgpio is 15x slower than RPi 3 bcm2835gpio** — each GPIO toggle goes through sysfs writes over the RP1 PCIe bridge, versus direct memory-mapped register access on RPi 3.
 
-2. **rp1-jtag recovers most of the lost performance** — the PIO approach is 6x faster than sysfsgpio on the same RPi 5 hardware, by offloading JTAG clocking to the RP1's PIO state machine.
+2. **rp1-jtag recovers most of the lost performance** — the PIO approach is 6-11x faster than sysfsgpio on the same RPi 5 hardware, by offloading JTAG clocking to the RP1's PIO state machine.
 
-3. **RPi 3 bcm2835gpio remains fastest in raw kB/s** — direct memory-mapped GPIO bit-banging has lower latency than PIO-mediated transfers. However, the RPi 3 is a much older, slower platform overall.
+3. **Bulk DMA gives 1.8x improvement for constant-TMS transfers** — eliminating SM1 and using 1024-bit chunks reduces total time from 6.3s to 3.5s for a 3.8 MB bitstream at 10 MHz TCK.
 
-4. **sysfsgpio on RPi 5 is faster than originally estimated** — we initially estimated ~5 kB/s based on simple test scripts, but OpenOCD 0.12's sysfsgpio driver achieves ~96 kB/s with optimized batched writes.
+4. **Per-chunk overhead overlaps with PIO processing** — at 10 MHz TCK, each 1024-bit chunk takes ~102 µs for PIO processing. The DMA/ioctl overhead (~50 µs) runs concurrently, giving ~16 µs net overhead per chunk.
 
-5. **SM lifecycle optimisation gives ~5% improvement** — eliminating per-chunk SM enable/disable reduced ioctl count by ~1,868 but this is <1% of the ~240,000 total DMA ioctls. The dominant bottleneck is the 32-byte DMA transfer granularity, not SM management.
+5. **RPi 3 bcm2835gpio still leads in throughput** — 1,428 kB/s vs 1,058 kB/s. The gap narrows with bulk DMA but direct memory-mapped GPIO remains faster than PIO + DMA + ioctl.
 
-6. **TCK frequency has no measurable effect** — 6/10/20 MHz all produce the same wall time, proving the PIO is idle most of the time waiting for the next DMA ioctl. Increasing DMA transfer size is the path to unlocking TCK scaling.
+6. **Higher TCK frequencies blocked by kernel DMA bug** — at clkdiv < 3 (> 16.67 MHz), DMA transfers fail after thousands of chunks. The RP1 PIO kernel driver's DMA completion callback is never invoked for slow SM programs with transfers > ~1024 bits. Kernel patches are needed to unlock 33 MHz TCK (~2,500 kB/s theoretical).
 
-7. **PIOLib kernel driver blocks concurrent DMA** — threaded bidirectional DMA deadlocks due to per-SM mutex in the ioctl path. Also, `config_xfer(buf_size > 32)` causes DMA timeouts. Overcoming the ioctl bottleneck requires kernel-level changes (bidi ioctl, separate fds, or finer-grained locking).
+7. **PIOLib kernel driver limits remain** — per-SM ioctl serialization prevents true bidirectional DMA. The 1024-bit chunk limit is a workaround for the DMA completion bug. Both issues require kernel-level fixes for further performance gains.
