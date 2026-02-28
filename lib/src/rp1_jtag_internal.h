@@ -36,16 +36,20 @@
 
 /* Maximum bits per DMA transfer chunk.
  *
- * The RP1 PIO kernel driver's DMA completion callback fails for
- * transfers exceeding ~1024 bits on slow SM programs (4 instr/bit).
- * Workaround: chunk into 1024-bit transfers with SM restart between
- * each. DMA config from init (DMA_BUF_SIZE=4096) is reused.
+ * Each chunk is a complete DMA round-trip: SM restart, TX DMA
+ * (count word + TDI data), RX DMA (TDO data + explicit push),
+ * with pthread for RX. Larger chunks reduce ioctl and thread
+ * overhead per bitstream.
  *
- * Each chunk: 1 count word + 32 TDI words = 132 bytes TX,
- *             33 RX words = 132 bytes. Both well within DMA_BUF_SIZE.
+ * Size limit: TX bytes = (1 + ceil(N/32)) * 4 must fit in
+ * DMA_BUF_SIZE (4096). At 30720 bits: TX = 3844 bytes.
+ *
+ * Verified working up to 16384 bits by test_many_shifts.
+ * 30720 gives ~995 chunks per 30M-bit bitstream (vs ~29,889
+ * at 1024 bits), reducing ioctl overhead by ~30x.
  *
  * Must be a multiple of BITS_PER_WORD (32). */
-#define BULK_CHUNK_BITS         1024
+#define BULK_CHUNK_BITS         30720
 
 /* Operating mode */
 typedef enum {
