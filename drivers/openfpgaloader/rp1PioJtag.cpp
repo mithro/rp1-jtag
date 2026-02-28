@@ -26,18 +26,29 @@ Rp1PioJtag::Rp1PioJtag(const jtag_pins_conf_t *pin_conf,
 {
 	(void)dev;  /* unused -- no device path needed for PIO */
 
-	if (!pin_conf) {
-		std::cerr << "rp1pio: pin configuration required (--pins tck=N:tms=N:tdi=N:tdo=N)" << std::endl;
-		return;
-	}
+	/* Default pins: NeTV2 wiring (TCK=4, TMS=17, TDI=27, TDO=22).
+	 * Override with --pins TDI:TDO:TCK:TMS (e.g. --pins 27:22:4:17).
+	 */
+	const int def_tck = 4, def_tms = 17, def_tdi = 27, def_tdo = 22;
 
-	rp1_jtag_pins_t pins = {
-		.tck = pin_conf->tck_pin,
-		.tms = pin_conf->tms_pin,
-		.tdi = pin_conf->tdi_pin,
-		.tdo = pin_conf->tdo_pin,
-		.srst = -1,
-		.trst = -1
+	rp1_jtag_pins_t pins;
+	if (!pin_conf ||
+	    (pin_conf->tck_pin == 0 && pin_conf->tms_pin == 0 &&
+	     pin_conf->tdi_pin == 0 && pin_conf->tdo_pin == 0)) {
+		pins = {def_tck, def_tms, def_tdi, def_tdo, -1, -1};
+		std::cerr << "rp1pio: using default pins"
+			<< " TCK=" << def_tck << " TMS=" << def_tms
+			<< " TDI=" << def_tdi << " TDO=" << def_tdo
+			<< std::endl;
+	} else {
+		pins = {
+			.tck = pin_conf->tck_pin,
+			.tms = pin_conf->tms_pin,
+			.tdi = pin_conf->tdi_pin,
+			.tdo = pin_conf->tdo_pin,
+			.srst = -1,
+			.trst = -1
+		};
 	};
 
 	if (_verbose) {

@@ -25,7 +25,7 @@ The RPi 5's GPIO pins connect to the RP1 chip via PCIe, making traditional softw
 
 ```bash
 # Prerequisites (Raspberry Pi 5 with Raspberry Pi OS)
-sudo apt install cmake build-essential git
+sudo apt install libfdt-dev cmake build-essential git
 
 # Build PIOLib from raspberrypi/utils
 git clone https://github.com/raspberrypi/utils.git
@@ -50,12 +50,46 @@ ctest --test-dir build
 sudo ./build/tests/hardware/test_pio_loopback
 ```
 
+### Install the library
+
+```bash
+# Install librp1jtag system-wide (needed by openFPGALoader / OpenOCD drivers)
+sudo cmake --install build
+sudo ldconfig
+```
+
+### Build openFPGALoader with rp1pio support
+
+openFPGALoader does not yet include the rp1pio cable driver upstream.
+Use the integration script in `drivers/openfpgaloader/` to patch a source tree:
+
+```bash
+# Install openFPGALoader build dependencies
+sudo apt install libfdt-dev libftdi1-dev libhidapi-dev pkg-config
+
+# Clone openFPGALoader and apply rp1pio driver patches
+git clone https://github.com/trabucayre/openFPGALoader.git
+cd rp1-jtag
+python3 drivers/openfpgaloader/integrate.py ../openFPGALoader
+
+# Build openFPGALoader with RP1 PIO enabled
+cmake -DENABLE_RP1_PIO=ON -B ../openFPGALoader/build -S ../openFPGALoader
+cmake --build ../openFPGALoader/build
+```
+
+See [drivers/openfpgaloader/README.md](drivers/openfpgaloader/README.md) for
+details on pin mapping, method mapping, and performance.
+
 ### Program an FPGA
 
 ```bash
-# Using openFPGALoader with rp1pio cable
-openFPGALoader -c rp1pio --detect
-openFPGALoader -c rp1pio bitstream.bit
+# Using openFPGALoader with rp1pio cable (requires sudo for /dev/pio0)
+# Default pins are NeTV2 wiring (TCK=4, TMS=17, TDI=27, TDO=22)
+sudo openFPGALoader -c rp1pio --detect
+sudo openFPGALoader -c rp1pio bitstream.bit
+
+# With explicit pin configuration (format: --pins TDI:TDO:TCK:TMS)
+sudo openFPGALoader -c rp1pio --pins 27:22:4:17 --detect
 
 # Using the library directly
 sudo ./build/examples/idcode_read --tck 4 --tms 17 --tdi 27 --tdo 22

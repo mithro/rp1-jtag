@@ -186,7 +186,13 @@ def main() -> None:
     link_anchor = 'endif(ENABLE_LIBGPIOD)\n'
     link_block = (
         '\nif (ENABLE_RP1_PIO)\n'
-        '\ttarget_link_libraries(openFPGALoader rp1jtag)\n'
+        '\tfind_path(RP1JTAG_INCLUDE_DIR rp1_jtag.h)\n'
+        '\tfind_library(RP1JTAG_LIBRARY rp1jtag)\n'
+        '\tif(NOT RP1JTAG_INCLUDE_DIR OR NOT RP1JTAG_LIBRARY)\n'
+        '\t\tmessage(FATAL_ERROR "librp1jtag not found (install rp1-jtag first)")\n'
+        '\tendif()\n'
+        '\tinclude_directories(${RP1JTAG_INCLUDE_DIR})\n'
+        '\ttarget_link_libraries(openFPGALoader ${RP1JTAG_LIBRARY})\n'
         '\t# PIOLib is a transitive dependency of librp1jtag (needed for static linking)\n'
         '\tfind_library(PIOLIB_LIBRARY pio)\n'
         '\tif(PIOLIB_LIBRARY)\n'
@@ -195,7 +201,7 @@ def main() -> None:
         '\tadd_definitions(-DENABLE_RP1_PIO=1)\n'
         'endif(ENABLE_RP1_PIO)\n'
     )
-    if 'target_link_libraries(openFPGALoader rp1jtag)' not in cmake:
+    if 'target_link_libraries(openFPGALoader ${RP1JTAG_LIBRARY})' not in cmake:
         # Find the LAST occurrence (the linking section, not the sources section)
         idx = cmake.rfind(link_anchor)
         if idx >= 0:
