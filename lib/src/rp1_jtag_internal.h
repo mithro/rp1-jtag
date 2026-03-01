@@ -36,20 +36,21 @@
 
 /* Maximum bits per DMA transfer chunk.
  *
- * Each chunk is a complete DMA round-trip: SM restart, TX DMA
- * (count word + TDI data), RX DMA (TDO data + explicit push),
- * with pthread for RX. Larger chunks reduce ioctl and thread
- * overhead per bitstream.
+ * Each chunk is a complete DMA round-trip: SM restart, sequential
+ * TX DMA then RX DMA (no concurrent DMA — see jtag_shift_bulk).
  *
- * Size limit: TX bytes = (1 + ceil(N/32)) * 4 must fit in
- * DMA_BUF_SIZE (4096). At 30720 bits: TX = 3844 bytes.
+ * Size limit: the RP1 PIO RX FIFO is 8 words deep. Each chunk
+ * produces ceil(N/32) autopush words + 1 explicit push word.
+ * TX DMA must complete before RX DMA starts (sequential), so
+ * ALL RX words must fit in the FIFO: ceil(N/32) + 1 ≤ 8,
+ * giving N ≤ 224 bits (7 * 32).
  *
- * Verified working up to 16384 bits by test_many_shifts.
- * 30720 gives ~995 chunks per 30M-bit bitstream (vs ~29,889
- * at 1024 bits), reducing ioctl overhead by ~30x.
+ * Concurrent TX+RX DMA on RP1 PIOLib causes data corruption
+ * (race condition in kernel driver). Sequential DMA with this
+ * chunk size is the workaround.
  *
  * Must be a multiple of BITS_PER_WORD (32). */
-#define BULK_CHUNK_BITS         30720
+#define BULK_CHUNK_BITS         224
 
 /* Operating mode */
 typedef enum {

@@ -383,17 +383,31 @@ static int jtag_shift_bulk(rp1_jtag_t *jtag, uint32_t num_bits,
         pio_sm_exec(pio, sm0, pio_encode_jmp(jtag->offset0));
         pio_sm_set_enabled(pio, sm0, true);
 
-        /* Launch RX DMA first (background thread), TX in main thread.
-         * RX must be ready before TX to prevent RX FIFO overflow. */
+        /* Sequential DMA: TX first (blocking), then RX (blocking).
+         *
+         * Concurrent TX+RX DMA on the same SM causes data corruption
+         * on RP1 PIOLib — the kernel driver has a race condition when
+         * two pio_sm_xfer_data ioctls execute simultaneously. Each
+         * direction works correctly in isolation (verified by
+         * test_nodma_shift), but both together corrupt the RX data.
+         *
+         * Sequential works for chunks ≤ 224 bits because:
+         * - TX DMA sends count + 7 data words = 32 bytes to TX FIFO
+         * - SM processes 224 bits: 7 autopush + 1 explicit push = 8
+         *   RX FIFO entries (exactly fills the 8-word FIFO)
+         * - TX DMA completes (SM has consumed all TX data)
+         * - RX DMA reads all 8 words from full RX FIFO
+         *
+         * BULK_CHUNK_BITS must be ≤ 224 (7 * 32) for this to work.
+         * Larger chunks overflow the 8-word RX FIFO, causing SM
+         * stall → TX backpressure → TX DMA timeout. */
         xfer_args_t tx_args = {pio, sm0, PIO_DIR_TO_SM,
                                chunk_tx_bytes, tx_buf, 0, 0};
         xfer_args_t rx_args = {pio, sm0, PIO_DIR_FROM_SM,
                                chunk_rx_bytes, rx_buf, 0, 0};
 
-        pthread_t t_rx;
-        pthread_create(&t_rx, NULL, xfer_thread, &rx_args);
         xfer_thread(&tx_args);
-        pthread_join(t_rx, NULL);
+        xfer_thread(&rx_args);
 
         if (tx_args.ret < 0 || rx_args.ret < 0) {
             /* Diagnostic: check FIFO state after failure */
