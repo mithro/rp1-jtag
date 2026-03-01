@@ -38,6 +38,22 @@ if(HAVE_PIOLIB)
     target_link_libraries(test_pio_minimal ${PIOLIB_LIBRARY})
 endif()
 
+add_executable(test_bypass_loopback test_bypass_loopback.c)
+target_link_libraries(test_bypass_loopback rp1jtag_static)
+
+add_executable(test_dma_diag test_dma_diag.c)
+target_link_libraries(test_dma_diag rp1jtag_static)
+
+add_executable(test_nodma_shift test_nodma_shift.c)
+target_link_libraries(test_nodma_shift rp1jtag_static)
+if(HAVE_PIOLIB)
+    target_compile_definitions(test_nodma_shift PRIVATE HAVE_PIOLIB)
+    target_include_directories(test_nodma_shift PRIVATE
+        ${PIOLIB_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/lib/src)
+    target_link_libraries(test_nodma_shift ${PIOLIB_LIBRARY})
+endif()
+
 add_executable(test_dma_sweep test_dma_sweep.c)
 target_link_libraries(test_dma_sweep rp1jtag_static)
 if(HAVE_PIOLIB)
