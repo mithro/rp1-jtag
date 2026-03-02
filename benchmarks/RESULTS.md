@@ -240,31 +240,86 @@ In the current code, the FIFO-write path is dispatched for `tdo == NULL && num_b
 
 **To achieve bulk DMA speeds again**, a way to do concurrent TX+RX DMA without corruption is needed — either kernel-level bidirectional DMA or mmap'd PIO register access to bypass the ioctl-per-word overhead.
 
+## RPi 5 — rp1-jtag hybrid streaming DMA (interleaved TX/RX)
+
+Measured on 2026-03-02. Bitstream programming via openFPGALoader with librp1jtag.
+
+- Single SM (SM0 only), TMS driven as constant GPIO output
+- Hybrid approach: streaming DMA for full 32-bit words + FIFO write for partial word
+- SM in streaming mode: `mov x, !null` + `jmp offset+2` (skips count-word protocol)
+- Autopull ON, autopush ON — 1:1 TX:RX word ratio
+- Interleaved TX then RX DMA in 32-byte (8-word) chunks
+- SM runs continuously — no restart between chunks
+- No padding — partial words handled via separate FIFO write phase
+- BYPASS test: 29/29 sizes pass (1 to 306,056 bits)
+- Pins: TDI=27, TDO=22, TCK=4, TMS=17
+- Bitstream: user-100.bit (3,825,888 bytes), XC7A100T, CRC verified by FPGA
+
+### 10 MHz (clkdiv=5)
+
+| Run | Wall time | DONE | kB/s |
+|-----|-----------|------|------|
+| 1 | 6.1s | 1 | 613 |
+| 2 | 6.07s | 1 | 616 |
+
+### 20 MHz (clkdiv=2.5)
+
+| Run | Wall time | DONE | kB/s |
+|-----|-----------|------|------|
+| 1 | 5.9s | 1 | 634 |
+| 2 | 6.09s | 1 | 614 |
+
+### Analysis
+
+Transfer time is **nearly identical at 10 MHz and 20 MHz** (~6.1s vs ~6.0s), confirming the bottleneck is **ioctl overhead, not TCK frequency**. Each 32-byte chunk requires 2 ioctls (TX xfer_data + RX xfer_data), giving ~240,000 ioctls per bitstream.
+
+**Why 32-byte chunks are the maximum:** with autopush ON, each TX word produces an RX word. The RP1 PIO RX FIFO is 8 words (32 bytes) deep. After processing 8 TX words, the RX FIFO is full and the SM stalls. We must drain RX (1 ioctl) before sending the next TX chunk (1 ioctl), limiting chunks to 32 bytes.
+
+**Why not concurrent TX+RX DMA:** concurrent DMA on the same SM corrupts RX data on RP1 PIOLib (verified via BYPASS test — all data integrity checks fail with concurrent pthreads). This is a race condition in the rp1-pio kernel driver's per-SM DMA mutex. Must use sequential TX-then-RX per chunk.
+
+**Why not TX-only DMA (autopush OFF):** TX-only DMA (calling config_xfer for both directions but only xfer_data for TX) leaves the kernel DMA state inconsistent. Subsequent sequential-path transfers hang in D-state (uninterruptible sleep), blocking post-programming IR readback.
+
+**Compared to other approaches (DONE=1 verified):**
+- Sequential DMA (224-bit chunks): 14.4s → hybrid is **2.4x faster**
+- FIFO-write (put_blocking): 9.42s → hybrid is **1.5x faster**
+
+The hybrid approach reduces ioctls per segment by ~4x vs sequential DMA (2 ioctls per 256-bit chunk vs 8 ioctls per 224-bit chunk), but the improvement is limited by the 8-word RX FIFO depth which prevents larger DMA chunks.
+
+**Path forward:** further speedup requires bypassing the ioctl-per-32-bytes limit — either concurrent DMA (needs kernel fix), larger RX FIFO (hardware), or mmap'd PIO register access.
+
 ## Summary
 
-| Platform | Method | Bitstream | Time | Throughput | vs RPi 5 sysfsgpio |
-|----------|--------|-----------|------|------------|-------------------|
-| RPi 5 | rp1-jtag bulk DMA @20MHz | 3.8 MB (100T) | 0.96s | 3,893 kB/s | 41x |
-| RPi 5 | rp1-jtag bulk DMA @15MHz | 3.8 MB (100T) | 1.22s | 3,053 kB/s | 32x |
-| RPi 5 | rp1-jtag bulk DMA @10MHz | 3.8 MB (100T) | 1.74s | 2,153 kB/s | 22x |
-| RPi 3B+ | OpenOCD bcm2835gpio | 2.1 MB (35T) | 1.50s | 1,428 kB/s | 15x |
-| RPi 5 | rp1-jtag bulk DMA @5MHz | 3.8 MB (100T) | 3.27s | 1,145 kB/s | 12x |
-| RPi 5 | rp1-jtag (two-SM chunked) | 3.8 MB (100T) | 6.3s | 589 kB/s | 6x |
-| RPi 5 | rp1-jtag FIFO-write | 3.8 MB (100T) | 9.42s | 397 kB/s | 4x |
-| RPi 5 | OpenOCD sysfsgpio | 3.8 MB (100T) | 39.0s | 96 kB/s | 1x (baseline) |
+| Platform | Method | Bitstream | Time | Throughput | DONE | vs sysfsgpio |
+|----------|--------|-----------|------|------------|------|-------------|
+| RPi 5 | rp1-jtag bulk DMA @20MHz | 3.8 MB (100T) | 0.96s | 3,893 kB/s | 1* | 41x |
+| RPi 5 | rp1-jtag bulk DMA @15MHz | 3.8 MB (100T) | 1.22s | 3,053 kB/s | 1* | 32x |
+| RPi 5 | rp1-jtag bulk DMA @10MHz | 3.8 MB (100T) | 1.74s | 2,153 kB/s | 1* | 22x |
+| RPi 3B+ | OpenOCD bcm2835gpio | 2.1 MB (35T) | 1.50s | 1,428 kB/s | 1 | 15x |
+| RPi 5 | rp1-jtag bulk DMA @5MHz | 3.8 MB (100T) | 3.27s | 1,145 kB/s | 1* | 12x |
+| RPi 5 | **rp1-jtag hybrid streaming** | **3.8 MB (100T)** | **6.1s** | **613 kB/s** | **1** | **6x** |
+| RPi 5 | rp1-jtag (two-SM chunked) | 3.8 MB (100T) | 6.3s | 589 kB/s | 1 | 6x |
+| RPi 5 | rp1-jtag FIFO-write | 3.8 MB (100T) | 9.42s | 397 kB/s | 1 | 4x |
+| RPi 5 | rp1-jtag sequential DMA | 3.8 MB (100T) | 14.4s | 260 kB/s | 1 | 3x |
+| RPi 5 | OpenOCD sysfsgpio | 3.8 MB (100T) | 39.0s | 96 kB/s | 1 | 1x (baseline) |
+
+\* Bulk DMA (30720-bit chunks) later found to corrupt JTAG data via BYPASS
+integrity test. FPGA DONE=1 was a false positive (CRC passed by chance or
+was not being fully checked). The code was reverted to sequential 224-bit
+chunks (14.4s) which pass all BYPASS tests. The hybrid streaming approach
+is the current active fast path for tdo==NULL transfers.
 
 ### Key observations
 
-1. **RPi 5 rp1-jtag now beats RPi 3 bcm2835gpio** — at 10 MHz and above, rp1-jtag outperforms the RPi 3B+'s direct memory-mapped GPIO (1,428 kB/s). At 20 MHz, throughput is 2.7x higher (3,893 vs 1,428 kB/s).
+1. **Hybrid streaming DMA is the current active fast path** — 6.1s at 10 MHz with verified DONE=1 and all 29 BYPASS data integrity tests passing. This is 2.4x faster than the sequential DMA fallback (14.4s) and 1.5x faster than the FIFO-write path (9.42s).
 
-2. **Transfer time scales with 1/TCK frequency** — proving that PIO/TCK is now the bottleneck, not ioctl overhead. Previous architecture (6.3s at any speed) was entirely ioctl-bound.
+2. **Ioctl overhead is the dominant bottleneck** — the hybrid path requires ~240,000 ioctls per bitstream (TX+RX per 32-byte chunk). Transfer time is frequency-independent (~6.1s at both 10 and 20 MHz), confirming ioctl overhead dominates.
 
-3. **41x faster than sysfsgpio** — at 20 MHz, rp1-jtag achieves 3,893 kB/s vs sysfsgpio's 96 kB/s on the same RPi 5 hardware.
+3. **8-word RX FIFO limits DMA chunk size** — with autopush ON, each TX word produces an RX word. The RX FIFO can hold 8 words (32 bytes). Larger chunks stall the SM when the RX FIFO overflows. This is the fundamental bottleneck preventing larger DMA transfers.
 
-4. **DMACTRL threshold was the root cause** — the previous "kernel DMA bug" was actually DMACTRL threshold misconfiguration. Threshold=8 (from rpi5-rp1-pio-bench defaults) caused 25% data corruption for transfers < 128 KB. Threshold=4 works reliably at all sizes.
+4. **Concurrent DMA corrupts data on RP1** — concurrent TX+RX DMA via pthreads on the same SM corrupts received data due to a race condition in the rp1-pio kernel driver's per-SM DMA mutex. Must use sequential TX-then-RX per chunk.
 
-5. **Dynamic RX threshold is required** — RX threshold=4 causes timeout for small shifts (< 4 RX words, DREQ never fires). RX threshold=1 causes AXI bus contention for large shifts (DMA attempts 8-word burst with only 1 word available, stalling shared AXI bus). Solution: threshold=4 for >= 4 RX words, threshold=1 for < 4 RX words.
+5. **Signal integrity limits max TCK to 20 MHz** — 25+ MHz TCK causes IDCODE corruption on the RPi-to-NeTV2 wiring. This is a hardware limitation, not software.
 
-6. **Signal integrity limits max TCK to 20 MHz** — 25+ MHz TCK causes IDCODE corruption on the RPi-to-NeTV2 wiring. This is a hardware limitation, not software.
+6. **Bulk DMA results were invalidated** — the 0.96s @20MHz bulk DMA results (30720-bit chunks) passed FPGA DONE but failed the BYPASS data integrity test. The code was reverted to data-integrity-verified approaches.
 
-7. **30720-bit chunks with DMACTRL fix give 2x over 1024-bit chunks** — previous bulk DMA attempt (1024-bit chunks, threshold=8) achieved 1,058 kB/s at 10 MHz. DMACTRL fix + 30x larger chunks improved this to 2,153 kB/s.
+7. **Path forward requires kernel changes** — further speedup needs either: concurrent DMA (kernel driver fix), larger RX FIFO (hardware), or mmap'd PIO register access (bypass ioctl overhead).
