@@ -54,14 +54,71 @@ if(HAVE_PIOLIB)
     target_link_libraries(test_nodma_shift ${PIOLIB_LIBRARY})
 endif()
 
-add_executable(test_dma_sweep test_dma_sweep.c)
-target_link_libraries(test_dma_sweep rp1jtag_static)
 if(HAVE_PIOLIB)
+    add_executable(test_txonly_dma test_txonly_dma.c)
+    target_compile_definitions(test_txonly_dma PRIVATE HAVE_PIOLIB)
+    target_include_directories(test_txonly_dma PRIVATE
+        ${PIOLIB_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/lib/src)
+    target_link_libraries(test_txonly_dma ${PIOLIB_LIBRARY})
+endif()
+
+if(HAVE_PIOLIB)
+    add_executable(test_txonly_hybrid test_txonly_hybrid.c)
+    target_compile_definitions(test_txonly_hybrid PRIVATE HAVE_PIOLIB)
+    target_include_directories(test_txonly_hybrid PRIVATE
+        ${PIOLIB_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/lib/src)
+    target_link_libraries(test_txonly_hybrid ${PIOLIB_LIBRARY})
+
+    add_executable(test_txonly_padded test_txonly_padded.c)
+    target_compile_definitions(test_txonly_padded PRIVATE HAVE_PIOLIB)
+    target_include_directories(test_txonly_padded PRIVATE
+        ${PIOLIB_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/lib/src)
+    target_link_libraries(test_txonly_padded ${PIOLIB_LIBRARY})
+
+    add_executable(test_txonly_diag test_txonly_diag.c)
+    target_compile_definitions(test_txonly_diag PRIVATE HAVE_PIOLIB)
+    target_include_directories(test_txonly_diag PRIVATE
+        ${PIOLIB_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/lib/src)
+    target_link_libraries(test_txonly_diag ${PIOLIB_LIBRARY})
+
+    add_executable(test_txonly_hybrid2 test_txonly_hybrid2.c)
+    target_compile_definitions(test_txonly_hybrid2 PRIVATE HAVE_PIOLIB)
+    target_include_directories(test_txonly_hybrid2 PRIVATE
+        ${PIOLIB_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/lib/src)
+    target_link_libraries(test_txonly_hybrid2 ${PIOLIB_LIBRARY})
+
+    add_executable(test_dma_sweep test_dma_sweep.c)
     target_compile_definitions(test_dma_sweep PRIVATE HAVE_PIOLIB)
     target_include_directories(test_dma_sweep PRIVATE
         ${PIOLIB_INCLUDE_DIR}
         ${CMAKE_SOURCE_DIR}/lib/src)
     target_link_libraries(test_dma_sweep ${PIOLIB_LIBRARY})
+
+    add_executable(test_streaming test_streaming.c)
+    target_compile_definitions(test_streaming PRIVATE HAVE_PIOLIB)
+    target_include_directories(test_streaming PRIVATE
+        ${PIOLIB_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/lib/src)
+    target_link_libraries(test_streaming ${PIOLIB_LIBRARY} pthread)
+
+    add_executable(test_fifo_write test_fifo_write.c)
+    target_compile_definitions(test_fifo_write PRIVATE HAVE_PIOLIB)
+    target_include_directories(test_fifo_write PRIVATE
+        ${PIOLIB_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/lib/src)
+    target_link_libraries(test_fifo_write ${PIOLIB_LIBRARY})
+
+    add_executable(test_txonly_minimal test_txonly_minimal.c)
+    target_compile_definitions(test_txonly_minimal PRIVATE HAVE_PIOLIB)
+    target_include_directories(test_txonly_minimal PRIVATE
+        ${PIOLIB_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/lib/src)
+    target_link_libraries(test_txonly_minimal ${PIOLIB_LIBRARY})
 endif()
 
 # Hardware tests are NOT added to CTest (they need real hardware).
