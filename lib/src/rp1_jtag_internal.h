@@ -36,9 +36,8 @@
 
 /* Maximum bits per DMA transfer chunk (sequential path).
  *
- * Used by the fallback sequential DMA path for small transfers
- * (< STREAM_THRESHOLD bits). Each chunk is a complete DMA round-trip:
- * SM restart, sequential TX DMA then RX DMA.
+ * Used by the sequential DMA path (tdo!=NULL). Each chunk is a
+ * complete DMA round-trip: SM restart, TX DMA then RX DMA.
  *
  * Size limit: the RP1 PIO RX FIFO is 8 words deep. Each chunk
  * produces ceil(N/32) autopush words + 1 explicit push word.
@@ -48,13 +47,6 @@
  *
  * Must be a multiple of BITS_PER_WORD (32). */
 #define BULK_CHUNK_BITS         224
-
-/* Minimum bit count to use the FIFO-write fast path.
- * Below this, use the sequential 224-bit DMA chunk path.
- * The FIFO-write path uses pio_sm_put_blocking (no DMA) with
- * autopush disabled, which avoids the RP1 DMA corruption bug.
- * Must be >= 32 (one full autopull word). */
-#define STREAM_THRESHOLD        1024
 
 /* Operating mode */
 typedef enum {
