@@ -43,3 +43,5 @@ loop:
     in pins, 1      side 1      ; Sample TDO, TCK HIGH (rising edge)
     jmp x-- loop    side 0      ; TCK LOW (falling edge), loop
     push            side 0      ; Flush remaining TDO bits to RX FIFO
+halt:
+    jmp halt        side 0      ; Halt: prevent consuming TX padding words
