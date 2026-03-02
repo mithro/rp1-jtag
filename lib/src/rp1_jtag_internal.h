@@ -49,21 +49,11 @@
  * Must be a multiple of BITS_PER_WORD (32). */
 #define BULK_CHUNK_BITS         224
 
-/* Bulk DMA buffer size for continuous-SM streaming mode.
- * Matches rpi5-rp1-pio-bench config (256 KB, buf_count=1).
- * Each xfer_data call transfers up to this many bytes. */
-#define BULK_DMA_SIZE           (256 * 1024)
-
-/* DMACTRL register value for bulk streaming DMA: DREQ enable +
- * high priority + threshold=8.
- * Matches heavy DMA channel burst size (PR #7190 fix).
- * Benchmark proves threshold=8 works correctly with concurrent
- * DMA and continuous SM (41.93 MB/s, 0% error rate). */
-#define BULK_DMACTRL            0xC0000108
-
-/* Minimum bit count to use continuous-SM streaming mode.
- * Below this, use the sequential 224-bit chunk path.
- * Must be >= 32 (one full autopull/autopush word). */
+/* Minimum bit count to use the FIFO-write fast path.
+ * Below this, use the sequential 224-bit DMA chunk path.
+ * The FIFO-write path uses pio_sm_put_blocking (no DMA) with
+ * autopush disabled, which avoids the RP1 DMA corruption bug.
+ * Must be >= 32 (one full autopull word). */
 #define STREAM_THRESHOLD        1024
 
 /* Operating mode */
