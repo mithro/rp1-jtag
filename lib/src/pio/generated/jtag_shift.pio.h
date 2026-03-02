@@ -13,7 +13,7 @@
 // ---------- //
 
 #define jtag_shift_wrap_target 0
-#define jtag_shift_wrap 6
+#define jtag_shift_wrap 7
 #define jtag_shift_pio_version 0
 
 static const uint16_t jtag_shift_program_instructions[] = {
@@ -25,13 +25,14 @@ static const uint16_t jtag_shift_program_instructions[] = {
     0x5001, //  4: in     pins, 1         side 1
     0x0042, //  5: jmp    x--, 2          side 0
     0x8020, //  6: push   block           side 0
+    0x0007, //  7: jmp    7               side 0  [halt]
             //     .wrap
 };
 
 #if !PICO_NO_HARDWARE
 static const struct pio_program jtag_shift_program = {
     .instructions = jtag_shift_program_instructions,
-    .length = 7,
+    .length = 8,
     .origin = -1,
     .pio_version = jtag_shift_pio_version,
 #if PICO_PIO_VERSION > 0
