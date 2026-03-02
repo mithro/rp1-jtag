@@ -192,6 +192,54 @@ Previous bulk DMA attempt (1024-bit chunks, no DMACTRL fix): 3.54s at 10 MHz, 1,
 3. config_xfer per shift (resets accumulated kernel DMA semaphore/head/tail state)
 4. pio_sm_clear_fifos per chunk (pio_sm_restart does NOT clear FIFOs)
 
+## RPi 5 — rp1-jtag FIFO-write fast path (count-word, no DMA)
+
+Measured on 2026-03-02. Bitstream programming via openFPGALoader with librp1jtag.
+
+- Single SM (SM0 only), TMS driven as constant GPIO output
+- Count-word protocol with autopush disabled
+- Data words written via `pio_sm_put_blocking` (no DMA)
+- SM shifts exactly `num_bits` bits per call, no padding
+- Activated when `tdo == NULL && num_bits >= STREAM_THRESHOLD` (1024 bits)
+- Falls back to sequential 224-bit DMA chunks for smaller transfers or when TDO needed
+- Pins: TDI=27, TDO=22, TCK=4, TMS=17
+- Bitstream: user-100.bit (3,825,888 bytes), XC7A100T, CRC verified by FPGA
+
+### 10 MHz (clkdiv=5)
+
+| Run | Wall time | DONE | kB/s |
+|-----|-----------|------|------|
+| 1 | 9.42s | 1 | 397 |
+
+### 15 MHz (clkdiv=3.33)
+
+| Run | Wall time | DONE | kB/s |
+|-----|-----------|------|------|
+| 1 | 9.42s | 1 | 397 |
+
+### 20 MHz (clkdiv=2.5)
+
+| Run | Wall time | DONE | kB/s |
+|-----|-----------|------|------|
+| 1 | 9.42s | 1 | 397 |
+
+### Analysis
+
+Transfer time is **identical at all frequencies** (9.42s), confirming the bottleneck is **PIOLib ioctl overhead, not TCK frequency**. Each `pio_sm_put_blocking` call is a kernel ioctl taking ~7us. The 3.8 MB bitstream requires ~962K ioctls (count word + data words per call × ~100 calls of ~9,570 words each).
+
+strace breakdown: 962,374 ioctls × 7us/ioctl = 6.7s kernel time + 2.7s userspace overhead.
+
+**Compared to bulk DMA (30720-bit chunks):**
+- FIFO-write: 9.42s (ioctl-limited, frequency-independent) — **DONE=1**
+- Bulk DMA @10MHz: 1.74s (TCK-limited, scales with frequency) — **DONE=1**
+- Bulk DMA @20MHz: 0.96s — **DONE=1**
+
+The FIFO-write path is **slower** than the previous bulk DMA path (30720-bit chunks, documented above) because each word requires a separate kernel ioctl, whereas DMA transfers thousands of words per ioctl. The bulk DMA path achieved 0.96s at 20 MHz (TCK-limited), while FIFO writes are ioctl-limited at 9.42s regardless of frequency.
+
+In the current code, the FIFO-write path is dispatched for `tdo == NULL && num_bits >= STREAM_THRESHOLD` (large write-only transfers like bitstream programming). The sequential 224-bit DMA chunk path handles all other cases (small transfers and transfers needing TDO readback).
+
+**To achieve bulk DMA speeds again**, a way to do concurrent TX+RX DMA without corruption is needed — either kernel-level bidirectional DMA or mmap'd PIO register access to bypass the ioctl-per-word overhead.
+
 ## Summary
 
 | Platform | Method | Bitstream | Time | Throughput | vs RPi 5 sysfsgpio |
@@ -202,6 +250,7 @@ Previous bulk DMA attempt (1024-bit chunks, no DMACTRL fix): 3.54s at 10 MHz, 1,
 | RPi 3B+ | OpenOCD bcm2835gpio | 2.1 MB (35T) | 1.50s | 1,428 kB/s | 15x |
 | RPi 5 | rp1-jtag bulk DMA @5MHz | 3.8 MB (100T) | 3.27s | 1,145 kB/s | 12x |
 | RPi 5 | rp1-jtag (two-SM chunked) | 3.8 MB (100T) | 6.3s | 589 kB/s | 6x |
+| RPi 5 | rp1-jtag FIFO-write | 3.8 MB (100T) | 9.42s | 397 kB/s | 4x |
 | RPi 5 | OpenOCD sysfsgpio | 3.8 MB (100T) | 39.0s | 96 kB/s | 1x (baseline) |
 
 ### Key observations
