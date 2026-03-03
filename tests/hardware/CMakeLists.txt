@@ -119,6 +119,13 @@ if(HAVE_PIOLIB)
         ${PIOLIB_INCLUDE_DIR}
         ${CMAKE_SOURCE_DIR}/lib/src)
     target_link_libraries(test_txonly_minimal ${PIOLIB_LIBRARY})
+
+    add_executable(test_concurrent_dma test_concurrent_dma.c)
+    target_compile_definitions(test_concurrent_dma PRIVATE HAVE_PIOLIB)
+    target_include_directories(test_concurrent_dma PRIVATE
+        ${PIOLIB_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/lib/src)
+    target_link_libraries(test_concurrent_dma ${PIOLIB_LIBRARY} pthread)
 endif()
 
 # Hardware tests are NOT added to CTest (they need real hardware).
