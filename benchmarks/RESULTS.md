@@ -242,7 +242,7 @@ In the current code, the FIFO-write path is dispatched for `tdo == NULL && num_b
 
 ## RPi 5 — rp1-jtag hybrid streaming DMA (interleaved TX/RX)
 
-Measured on 2026-03-02. Bitstream programming via openFPGALoader with librp1jtag.
+Measured on 2026-03-02 and 2026-03-03. Bitstream programming via openFPGALoader with librp1jtag.
 
 - Single SM (SM0 only), TMS driven as constant GPIO output
 - Hybrid approach: streaming DMA for full 32-bit words + FIFO write for partial word
@@ -251,6 +251,7 @@ Measured on 2026-03-02. Bitstream programming via openFPGALoader with librp1jtag
 - Interleaved TX then RX DMA in 32-byte (8-word) chunks
 - SM runs continuously — no restart between chunks
 - No padding — partial words handled via separate FIFO write phase
+- SM initialised via `pio_sm_init()` with full config (not standalone `pio_sm_set_clkdiv`)
 - BYPASS test: 29/29 sizes pass (1 to 306,056 bits)
 - Pins: TDI=27, TDO=22, TCK=4, TMS=17
 - Bitstream: user-100.bit (3,825,888 bytes), XC7A100T, CRC verified by FPGA
@@ -269,15 +270,44 @@ Measured on 2026-03-02. Bitstream programming via openFPGALoader with librp1jtag
 | 1 | 5.9s | 1 | 634 |
 | 2 | 6.09s | 1 | 614 |
 
+### Concurrent DMA attempt (DONE=0)
+
+Before settling on interleaved DMA, concurrent TX+RX DMA via pthreads was
+tested (identical architecture to `rpi5-rp1-pio-bench` which achieves 42 MB/s).
+The concurrent approach gives **DONE=0** — FPGA rejects the bitstream.
+BYPASS loopback tests also fail with concurrent DMA (data corruption).
+Reverting to interleaved (sequential TX-then-RX per chunk) restores DONE=1.
+
+This confirms that concurrent DMA on the same SM corrupts data on RP1 PIOLib,
+likely due to a race condition in the rp1-pio kernel driver's per-SM DMA mutex.
+
+### RP1 PIO 2× clock factor
+
+Testing revealed that the RP1 PIO state machine runs at **exactly 2× the
+calculated TCK frequency**. With `RP1_PIO_CLK_HZ=200 MHz` and `INSTR_PER_BIT=4`:
+
+| Requested freq | clkdiv | Expected TCK | Measured TCK |
+|---------------|--------|-------------|-------------|
+| 5 MHz | 10 | 5 MHz | 10 MHz |
+| 10 MHz | 5 | 10 MHz | 20 MHz |
+
+The factor is perfectly consistent: `clock_get_hz(clk_sys)` reports 200 MHz,
+but the SM executes instructions at 2× that rate. This may indicate the RP1 PIO
+clock is actually 400 MHz, or that the divider formula differs from RP2040.
+The 2× factor does **not** cause DONE=0 (tested at 1 MHz/2 MHz actual — still DONE=1
+with interleaved DMA, still DONE=0 with concurrent DMA).
+
 ### Analysis
 
 Transfer time is **nearly identical at 10 MHz and 20 MHz** (~6.1s vs ~6.0s), confirming the bottleneck is **ioctl overhead, not TCK frequency**. Each 32-byte chunk requires 2 ioctls (TX xfer_data + RX xfer_data), giving ~240,000 ioctls per bitstream.
 
 **Why 32-byte chunks are the maximum:** with autopush ON, each TX word produces an RX word. The RP1 PIO RX FIFO is 8 words (32 bytes) deep. After processing 8 TX words, the RX FIFO is full and the SM stalls. We must drain RX (1 ioctl) before sending the next TX chunk (1 ioctl), limiting chunks to 32 bytes.
 
-**Why not concurrent TX+RX DMA:** concurrent DMA on the same SM corrupts RX data on RP1 PIOLib (verified via BYPASS test — all data integrity checks fail with concurrent pthreads). This is a race condition in the rp1-pio kernel driver's per-SM DMA mutex. Must use sequential TX-then-RX per chunk.
+**Why not concurrent TX+RX DMA:** concurrent DMA on the same SM gives DONE=0 on RP1 PIOLib (verified: concurrent pthreads → DONE=0, interleaved sequential → DONE=1, with identical data). BYPASS tests also fail with concurrent DMA. This is a race condition in the rp1-pio kernel driver's per-SM DMA mutex. Must use sequential TX-then-RX per chunk.
 
 **Why not TX-only DMA (autopush OFF):** TX-only DMA (calling config_xfer for both directions but only xfer_data for TX) leaves the kernel DMA state inconsistent. Subsequent sequential-path transfers hang in D-state (uninterruptible sleep), blocking post-programming IR readback.
+
+**SM init vs standalone clkdiv:** `pio_sm_set_clkdiv()` does not reliably apply the clock divider on RP1. Must use `pio_sm_init()` with a full `pio_sm_config` struct. The 2× clock factor persists regardless of init method.
 
 **Compared to other approaches (DONE=1 verified):**
 - Sequential DMA (224-bit chunks): 14.4s → hybrid is **2.4x faster**
@@ -322,4 +352,8 @@ is the current active fast path for tdo==NULL transfers.
 
 6. **Bulk DMA results were invalidated** — the 0.96s @20MHz bulk DMA results (30720-bit chunks) passed FPGA DONE but failed the BYPASS data integrity test. The code was reverted to data-integrity-verified approaches.
 
-7. **Path forward requires kernel changes** — further speedup needs either: concurrent DMA (kernel driver fix), larger RX FIFO (hardware), or mmap'd PIO register access (bypass ioctl overhead).
+7. **RP1 PIO runs at 2× calculated frequency** — `clock_get_hz(clk_sys)` reports 200 MHz but the SM executes at 2× that rate. A divider of 5 (expected 10 MHz TCK) produces 20 MHz TCK. The factor is perfectly consistent and does not affect correctness. Root cause unknown — may be a 400 MHz PIO clock or a divider formula difference from RP2040.
+
+8. **`pio_sm_init()` required for clock divider** — standalone `pio_sm_set_clkdiv()` does not reliably apply on RP1. Must use `pio_sm_init()` with a full `pio_sm_config` struct.
+
+9. **Path forward requires kernel changes** — further speedup needs either: concurrent DMA (kernel driver fix), larger RX FIFO (hardware), or mmap'd PIO register access (bypass ioctl overhead).
