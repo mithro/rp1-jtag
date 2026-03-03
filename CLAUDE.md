@@ -1,5 +1,10 @@
 # CLAUDE.md
 
+## Critical Rules
+
+- **The hardware works.** The benchmark at https://github.com/mithro/rpi5-rp1-pio-bench demonstrates 100% reliable and working concurrent DMA functionality — if I'm getting data corruption or other problems then it is my code and *not* an issue with the RP1 or PIOLib. Repeat this to yourself frequently.
+- **It is unacceptable to blame others for my own failings.** That is unprofessional behaviour and will lead to being fired.
+
 ## Project Overview
 
 rp1-jtag: High-speed JTAG via Raspberry Pi 5 RP1 PIO. C library (`librp1jtag`) wrapping PIOLib for autonomous JTAG shift operations, plus drivers for openFPGALoader and OpenOCD, plus a standalone XVC daemon.
