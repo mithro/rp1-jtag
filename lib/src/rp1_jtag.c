@@ -144,11 +144,19 @@ void words_to_bits(const uint32_t *words, uint32_t num_words,
 #define DMACTRL_RX_1    0xC0000101  /* enable + high_pri + threshold=1 */
 #define DMACTRL_RX_THRESHOLD_MIN_WORDS 4  /* use threshold=1 when < 4 RX words */
 
-/* DMA buffer size for TX-only streaming path.
+/* DMA chunk size for TX-only streaming path.
  * Each xfer_data call transfers up to this many bytes.
- * Must be ≤ TX FIFO depth (8 words = 32 bytes) to prevent overflow:
- * AXI posted writes may bypass DREQ pacing for large bounce buffers. */
-#define STREAM_DMA_BUF  (256 * 1024)
+ *
+ * Must be ≤ 16 bytes (4 words) to prevent TX FIFO overflow:
+ * the RP1 DMA controller does not honour DREQ pacing for PIO
+ * TX writes — data is blasted at PCIe/AXI speed regardless of
+ * FIFO occupancy.  With the JTAG SM consuming ~1 word per 6 µs
+ * and DMA writing at ~2 ns/word, transfers larger than the FIFO
+ * depth (8 words) silently overflow.  Empirically:
+ *   16 bytes (4 words) → DONE=1  (PASS)
+ *   32 bytes (8 words) → DONE=0  (FAIL, = FIFO depth)
+ */
+#define STREAM_DMA_BUF  16
 
 /* DMA transfer thread args */
 typedef struct {
@@ -171,9 +179,9 @@ static void *xfer_thread(void *arg)
     return NULL;
 }
 
-/* DMA transfer thread: loops over DMA_BUF_SIZE-sized chunks.
- * For transfers larger than the kernel bounce buffer, each iteration
- * calls xfer_data with up to DMA_BUF_SIZE bytes. */
+/* DMA transfer thread: loops over STREAM_DMA_BUF-sized chunks.
+ * For transfers larger than the per-call limit, each iteration
+ * calls xfer_data with up to STREAM_DMA_BUF bytes. */
 static void *xfer_loop_thread(void *arg)
 {
     xfer_args_t *a = (xfer_args_t *)arg;
@@ -181,7 +189,7 @@ static void *xfer_loop_thread(void *arg)
     size_t remaining = a->size;
 
     while (remaining > 0) {
-        size_t chunk = remaining > DMA_BUF_SIZE ? DMA_BUF_SIZE : remaining;
+        size_t chunk = remaining > STREAM_DMA_BUF ? STREAM_DMA_BUF : remaining;
         errno = 0;
         a->ret = pio_sm_xfer_data(a->pio, a->sm, a->dir, chunk, ptr);
         a->err = errno;
@@ -507,8 +515,9 @@ static int jtag_shift_streaming(rp1_jtag_t *jtag, uint32_t num_bits,
         pio_sm_init(pio, sm0, jtag->offset0, &c);
     }
 
-    /* Configure TX DMA. config_xfer resets DMACTRL, so set after. */
-    if (pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, DMA_BUF_SIZE, 1) < 0) {
+    /* Configure TX DMA with small bounce buffer to match chunk size.
+     * config_xfer resets DMACTRL, so set DMACTRL after. */
+    if (pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, STREAM_DMA_BUF, 1) < 0) {
         fprintf(stderr, "rp1_jtag: streaming config_xfer failed\n");
         ret = RP1_JTAG_ERR_IO;
         goto cleanup;
@@ -527,8 +536,8 @@ static int jtag_shift_streaming(rp1_jtag_t *jtag, uint32_t num_bits,
     clock_gettime(CLOCK_MONOTONIC, &t_enable);
 
     /* TX DMA: send full data words.
-     * xfer_loop_thread chunks into DMA_BUF_SIZE-sized pieces.
-     * DMA blocks until all data consumed by SM via DREQ pacing. */
+     * xfer_loop_thread chunks into STREAM_DMA_BUF-sized pieces (16B).
+     * Small chunks prevent TX FIFO overflow (DREQ not honoured). */
     {
         xfer_args_t tx_args = {pio, sm0, PIO_DIR_TO_SM,
                                tx_bytes, tx_buf, 0, 0};
