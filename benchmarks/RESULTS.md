@@ -104,13 +104,15 @@ The ~0.2s variance between fast (6.21s) and slow (6.42s) runs is OS scheduling j
 - Attempted: concurrent TX + RX DMA via pthreads to eliminate 32-byte ping-pong
 - Goal: transfer entire 32 KB chunks in a single bidi call (~2 ioctls instead of ~8,192)
 
-### Result: BLOCKED by PIOLib kernel driver
+### Result: FAILED (bug in our code)
 
-Two kernel-level limitations prevent concurrent DMA:
+Note: `rpi5-rp1-pio-bench` achieves 42 MB/s with concurrent DMA on the same hardware, proving the kernel driver handles concurrent DMA correctly. The failures below are bugs in our SM setup or DMA configuration, not kernel limitations.
 
-1. **Per-SM ioctl serialization**: PIOLib's `pio_sm_xfer_data()` holds a per-SM mutex in the kernel. When the RX thread enters the kernel first and blocks waiting for SM data, the TX thread can't acquire the mutex to start feeding the SM. Result: deadlock → DMA timeout after ~1s.
+Two issues observed (root cause in our code, not yet identified):
 
-2. **config_xfer buf_size > 32 bytes causes DMA timeout**: Even with single-direction ping-pong, calling `pio_sm_config_xfer(buf_size=32768)` causes subsequent `pio_sm_xfer_data(32 bytes)` transfers to fail with a DMA timeout, despite the buf_size being a maximum, not an exact match. This is likely a PIOLib DMA buffer allocation issue.
+1. **Per-SM ioctl serialization**: PIOLib's `pio_sm_xfer_data()` holds a per-SM mutex in the kernel. When the RX thread enters the kernel first and blocks waiting for SM data, the TX thread can't acquire the mutex to start feeding the SM. Result: deadlock → DMA timeout after ~1s. (The benchmark avoids this — need to investigate how.)
+
+2. **config_xfer buf_size > 32 bytes causes DMA timeout**: Even with single-direction ping-pong, calling `pio_sm_config_xfer(buf_size=32768)` causes subsequent `pio_sm_xfer_data(32 bytes)` transfers to fail with a DMA timeout. (The benchmark uses 256 KB buf_size successfully — need to diff our config.)
 
 ### Performance with bidi disabled (code present but NULL in vtable)
 
@@ -125,10 +127,10 @@ No regression from the added code. Performance matches the post-SM-optimisation 
 
 ### Path forward
 
-Eliminating the ioctl bottleneck requires kernel-level changes:
-- A kernel-level bidirectional DMA ioctl that sets up both TX and RX DMA channels atomically
-- Or using separate PIO file descriptors (separate mutexes) for TX and RX
-- Or patching PIOLib to use finer-grained locking (per-direction, not per-SM)
+Fix our concurrent DMA implementation to match the working `rpi5-rp1-pio-bench` architecture:
+- Diff our SM setup, DMA config, and buffer handling against the benchmark
+- The benchmark uses concurrent pthreads with 256 KB transfers at 42 MB/s on the same hardware
+- The kernel driver works correctly — the bug is in our code
 
 ## RPi 5 — rp1-jtag bulk DMA (single-SM, constant TMS)
 
@@ -238,7 +240,7 @@ The FIFO-write path is **slower** than the previous bulk DMA path (30720-bit chu
 
 In the current code, the FIFO-write path is dispatched for `tdo == NULL && num_bits >= STREAM_THRESHOLD` (large write-only transfers like bitstream programming). The sequential 224-bit DMA chunk path handles all other cases (small transfers and transfers needing TDO readback).
 
-**To achieve bulk DMA speeds again**, a way to do concurrent TX+RX DMA without corruption is needed — either kernel-level bidirectional DMA or mmap'd PIO register access to bypass the ioctl-per-word overhead.
+**To achieve bulk DMA speeds again**, the concurrent DMA bug in our code must be found and fixed. `rpi5-rp1-pio-bench` proves concurrent DMA works at 42 MB/s on this hardware — the bug is in our SM setup or DMA configuration.
 
 ## RPi 5 — rp1-jtag hybrid streaming DMA (interleaved TX/RX)
 
@@ -278,8 +280,9 @@ The concurrent approach gives **DONE=0** — FPGA rejects the bitstream.
 BYPASS loopback tests also fail with concurrent DMA (data corruption).
 Reverting to interleaved (sequential TX-then-RX per chunk) restores DONE=1.
 
-This confirms that concurrent DMA on the same SM corrupts data on RP1 PIOLib,
-likely due to a race condition in the rp1-pio kernel driver's per-SM DMA mutex.
+The root cause is a bug in the rp1-jtag library's SM setup or DMA configuration,
+NOT the kernel driver. The benchmark at rpi5-rp1-pio-bench achieves 42 MB/s with
+concurrent DMA on the same hardware, proving the kernel driver works correctly.
 
 ### RP1 PIO 2× clock factor
 
@@ -303,7 +306,7 @@ Transfer time is **nearly identical at 10 MHz and 20 MHz** (~6.1s vs ~6.0s), con
 
 **Why 32-byte chunks are the maximum:** with autopush ON, each TX word produces an RX word. The RP1 PIO RX FIFO is 8 words (32 bytes) deep. After processing 8 TX words, the RX FIFO is full and the SM stalls. We must drain RX (1 ioctl) before sending the next TX chunk (1 ioctl), limiting chunks to 32 bytes.
 
-**Why not concurrent TX+RX DMA:** concurrent DMA on the same SM gives DONE=0 on RP1 PIOLib (verified: concurrent pthreads → DONE=0, interleaved sequential → DONE=1, with identical data). BYPASS tests also fail with concurrent DMA. This is a race condition in the rp1-pio kernel driver's per-SM DMA mutex. Must use sequential TX-then-RX per chunk.
+**Why not concurrent TX+RX DMA (yet):** our concurrent DMA attempt gives DONE=0 (concurrent pthreads → DONE=0, interleaved sequential → DONE=1). However, `rpi5-rp1-pio-bench` achieves 42 MB/s with concurrent DMA on the same hardware, proving the kernel driver handles it correctly. The bug is in our SM setup or DMA configuration — not yet root-caused.
 
 **Why not TX-only DMA (autopush OFF):** TX-only DMA (calling config_xfer for both directions but only xfer_data for TX) leaves the kernel DMA state inconsistent. Subsequent sequential-path transfers hang in D-state (uninterruptible sleep), blocking post-programming IR readback.
 
@@ -315,7 +318,7 @@ Transfer time is **nearly identical at 10 MHz and 20 MHz** (~6.1s vs ~6.0s), con
 
 The hybrid approach reduces ioctls per segment by ~4x vs sequential DMA (2 ioctls per 256-bit chunk vs 8 ioctls per 224-bit chunk), but the improvement is limited by the 8-word RX FIFO depth which prevents larger DMA chunks.
 
-**Path forward:** further speedup requires bypassing the ioctl-per-32-bytes limit — either concurrent DMA (needs kernel fix), larger RX FIFO (hardware), or mmap'd PIO register access.
+**Path forward:** further speedup requires fixing our concurrent DMA implementation to match the working `rpi5-rp1-pio-bench` architecture (which achieves 42 MB/s). The kernel driver supports concurrent DMA correctly — the bug is in our code.
 
 ## Summary
 
@@ -346,7 +349,7 @@ is the current active fast path for tdo==NULL transfers.
 
 3. **8-word RX FIFO limits DMA chunk size** — with autopush ON, each TX word produces an RX word. The RX FIFO can hold 8 words (32 bytes). Larger chunks stall the SM when the RX FIFO overflows. This is the fundamental bottleneck preventing larger DMA transfers.
 
-4. **Concurrent DMA corrupts data on RP1** — concurrent TX+RX DMA via pthreads on the same SM corrupts received data due to a race condition in the rp1-pio kernel driver's per-SM DMA mutex. Must use sequential TX-then-RX per chunk.
+4. **Concurrent DMA fails in rp1-jtag (bug in our code)** — our concurrent TX+RX DMA via pthreads gives DONE=0. However, `rpi5-rp1-pio-bench` achieves 42 MB/s with concurrent DMA on the same hardware, proving the kernel driver works correctly. The root cause is a bug in our SM setup or DMA configuration, not yet identified.
 
 5. **Signal integrity limits max TCK to 20 MHz** — 25+ MHz TCK causes IDCODE corruption on the RPi-to-NeTV2 wiring. This is a hardware limitation, not software.
 
@@ -356,4 +359,4 @@ is the current active fast path for tdo==NULL transfers.
 
 8. **`pio_sm_init()` required for clock divider** — standalone `pio_sm_set_clkdiv()` does not reliably apply on RP1. Must use `pio_sm_init()` with a full `pio_sm_config` struct.
 
-9. **Path forward requires kernel changes** — further speedup needs either: concurrent DMA (kernel driver fix), larger RX FIFO (hardware), or mmap'd PIO register access (bypass ioctl overhead).
+9. **Path forward: fix our concurrent DMA bug** — `rpi5-rp1-pio-bench` proves concurrent DMA works on this hardware at 42 MB/s. Our concurrent DMA attempt fails due to a bug in our SM setup or DMA configuration. Finding and fixing this bug should bring transfer time under 1 second.
