@@ -38,11 +38,15 @@ class Rp1PioJtag : public JtagInterface {
 
 	int get_buffer_size() override { return 0; }
 	bool isFull() override { return false; }
-	int flush() override { return 0; }
+	int flush() override;
 
  private:
+	int flushBuffer();
+
 	struct rp1_jtag *_jtag;
 	int8_t _verbose;
+	uint32_t _buf_word;   /* buffered tail bits (LSB-justified, 0-31 bits) */
+	uint8_t  _buf_bits;   /* number of valid bits in _buf_word (0-31) */
 };
 
 #endif  // SRC_RP1PIOJTAG_HPP_
