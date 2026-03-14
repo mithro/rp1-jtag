@@ -1,0 +1,39 @@
+;
+; jtag_stream.pio - Fast streaming JTAG shift (2 instructions per bit)
+;
+; Optimized for bulk bitstream transfers where TMS is held constant
+; (set via GPIO before the transfer starts).  No count word, no nop
+; for TMS setup, no jmp — the .wrap loop is free.
+;
+; Pin assignment (same as jtag_shift):
+;   - SIDESET pin 0: TCK (toggled every instruction)
+;   - OUT pin 0:     TDI (data shifted out from TX FIFO)
+;   - IN pin 0:      TDO (data shifted in to RX FIFO)
+;
+; TX FIFO protocol:
+;   Word 0..N: TDI data, LSB-first, 32 bits per word (autopull).
+;   No count word — SM runs until disabled by host.
+;
+; RX FIFO output (when autopush ON):
+;   TDO data, LSB-first, 32 bits per word (autopush).
+;   1:1 ratio with TX words.
+;
+; JTAG timing (per bit, 2 cycles):
+;   Cycle 0: out pins, 1  side 0 -- TDI output, TCK LOW (setup)
+;   Cycle 1: in pins, 1   side 1 -- TCK HIGH (rising edge), sample TDO
+;
+; At 200 MHz PIO clock (5 ns/cycle):
+;   - TDI setup before rising edge: 1 cycle = 5 ns
+;   - TDO sample on rising edge: same cycle
+;   - TCK period: 2 cycles = 10 ns = 100 MHz max
+;   - With divider 1.5: 66.7 MHz (Artix-7 max)
+;   - With divider 3.0: 33.3 MHz (safe with 2× RP1 clock factor)
+;
+
+.program jtag_stream
+.side_set 1
+
+.wrap_target
+    out pins, 1  side 0   ; Drive TDI, TCK LOW (setup phase)
+    in pins, 1   side 1   ; Sample TDO, TCK HIGH (rising edge)
+.wrap
