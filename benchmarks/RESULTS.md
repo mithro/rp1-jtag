@@ -171,7 +171,7 @@ Measured on 2026-02-28. Bitstream programming via openFPGALoader with librp1jtag
 
 ### 25+ MHz
 
-IDCODE corruption at 25 MHz and 33 MHz (reads 0x26c62127 instead of 0x13631093 — 1-bit shift pattern). This is a signal integrity issue on the RPi-to-NeTV2 wiring, not a software bug. Maximum reliable TCK for this hardware setup is 20 MHz.
+IDCODE corruption at 22+ MHz (e.g., 0x26c62127 instead of 0x13631093 — 1-bit shift pattern). At 22 MHz, single-bit errors appear; at 23+ MHz, fully corrupted. Maximum reliable IDCODE read TCK is 21 MHz. Root cause not yet identified.
 
 ### Analysis
 
@@ -351,7 +351,7 @@ is the current active fast path for tdo==NULL transfers.
 
 4. **Concurrent DMA fails in rp1-jtag (bug in our code)** — our concurrent TX+RX DMA via pthreads gives DONE=0. However, `rpi5-rp1-pio-bench` achieves 42 MB/s with concurrent DMA on the same hardware, proving the kernel driver works correctly. The root cause is a bug in our SM setup or DMA configuration, not yet identified.
 
-5. **Signal integrity limits max TCK to 20 MHz** — 25+ MHz TCK causes IDCODE corruption on the RPi-to-NeTV2 wiring. This is a hardware limitation, not software.
+5. **IDCODE reads limited to 21 MHz TCK** — at 22+ MHz, IDCODE shows a 1-bit shift corruption pattern. Root cause not yet identified.
 
 6. **Bulk DMA results were invalidated** — the 0.96s @20MHz bulk DMA results (30720-bit chunks) passed FPGA DONE but failed the BYPASS data integrity test. The code was reverted to data-integrity-verified approaches.
 

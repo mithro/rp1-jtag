@@ -161,9 +161,11 @@ The NeTV2 is a Crowd Supply-funded video overlay board designed by bunnie
 | rpi5-netv2| XC7A100T      | `0x13631093`   | ~3.8 MB        |
 | rpi3-netv2| XC7A35T       | `0x0362d093`   | ~1.0 MB        |
 
-The Artix-7 JTAG interface supports up to 66 MHz TCK. At the current
-wiring lengths, reliable operation has been verified up to ~33 MHz
-requested (which is ~66 MHz actual due to the 2x RP1 PIO clock factor).
+The Artix-7 JTAG interface supports up to 66 MHz TCK. Reliable
+IDCODE reads have been verified up to 21 MHz TCK. At 22 MHz,
+single-bit errors appear; at 23+ MHz, IDCODE is fully corrupted
+with a characteristic 1-bit shift pattern. Root cause not yet
+identified.
 
 ## IDCODE Reference
 
