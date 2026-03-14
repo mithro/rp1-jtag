@@ -38,6 +38,7 @@
 #include "pio/generated/jtag_shift.pio.h"
 /* jtag_tms.pio.h no longer needed — SM1 uses set_pins_with_mask */
 #include "pio/generated/jtag_loopback.pio.h"
+#include "pio/generated/jtag_stream.pio.h"
 #endif
 
 /* ---- Bit vector utilities ---- */
@@ -147,17 +148,15 @@ void words_to_bits(const uint32_t *words, uint32_t num_words,
 /* DMA chunk size for TX-only streaming path.
  * Each xfer_data call transfers up to this many bytes.
  *
- * Must be < TX FIFO depth (8 words = 32 bytes).  RP1 DMA does not
- * honour DREQ pacing when the SM is slower than DMA — the entire
- * chunk is written at PCIe speed.  Chunks ≤ 7 words fit in the FIFO
- * without overflow.  28 bytes (7 words) is the maximum safe value.
+ * The streaming path uses PIO_FIFO_JOIN_TX (16-deep TX FIFO) and
+ * the jtag_stream program (2 instr/bit).  RP1 DMA writes each chunk
+ * at PCIe speed without DREQ pacing, so the chunk must fit entirely
+ * in the joined FIFO.  15 words (60 bytes) leaves 1 word margin.
  *
- * Empirically (3.8 MB XC7A100T bitstream at 10 MHz):
- *   28 bytes (7 words) → DONE=1, 3.58s
- *   32 bytes (8 words) → DONE=0 (FIFO overflow)
- *   16 bytes (4 words) → DONE=1, 6.13s (slower, more ioctls)
+ * With 8-deep FIFO (no join): max 7 words = 28 bytes
+ * With 16-deep FIFO (joined): max 15 words = 60 bytes
  */
-#define STREAM_DMA_BUF  28
+#define STREAM_DMA_BUF  4096
 
 /* DMA transfer thread args */
 typedef struct {
@@ -474,54 +473,60 @@ static int jtag_shift_streaming(rp1_jtag_t *jtag, uint32_t num_bits,
         bits_to_words(tdi, start_bit, stream_bits, tx_buf);
     }
 
-    /* SM init with autopush OFF for TX-only streaming DMA. */
+    /* SM init with jtag_stream program (2 instr/bit, autopush OFF).
+     * Uses STREAM_INSTR_PER_BIT for clock divider calculation. */
     pio_sm_set_enabled(pio, sm0, false);
     pio_sm_clear_fifos(pio, sm0);
     pio_sm_restart(pio, sm0);
+    float stream_div;
     pio_select(pio);
     {
-        pio_sm_config c = jtag_shift_program_get_default_config(jtag->offset0);
+        pio_sm_config c = jtag_stream_program_get_default_config(
+                              jtag->offset_stream);
         sm_config_set_out_pins(&c, jtag->pins.tdi, 1);
         sm_config_set_in_pins(&c, jtag->pins.tdo);
         sm_config_set_sideset_pins(&c, jtag->pins.tck);
         sm_config_set_out_shift(&c, true, true, 32);    /* autopull ON */
         sm_config_set_in_shift(&c, true, false, 32);    /* autopush OFF */
-        float div = (float)RP1_PIO_CLK_HZ /
-                    ((float)jtag->freq_hz * INSTR_PER_BIT);
-        if (div < 1.0f) div = 1.0f;
-        sm_config_set_clkdiv(&c, div);
-        pio_sm_init(pio, sm0, jtag->offset0, &c);
+        sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);  /* 16-deep TX FIFO */
+        stream_div = (float)RP1_PIO_CLK_HZ /
+                     ((float)jtag->freq_hz * STREAM_INSTR_PER_BIT);
+        if (stream_div < 1.0f) stream_div = 1.0f;
+        sm_config_set_clkdiv(&c, stream_div);
+        pio_sm_init(pio, sm0, jtag->offset_stream, &c);
     }
 
-    /* Configure TX-only DMA.  Use DMA_BUF_SIZE as bounce buffer and
-     * loop over chunks — each chunk is DREQ-paced by hardware.
+    /* Max chunk size is limited by TX FIFO depth (8 words = 32 bytes).
+     * Each xfer_data call writes the entire chunk at PCIe speed without
+     * DREQ pacing, so it must fit in the FIFO.  Use 7 words (28 bytes)
+     * to leave 1 word margin for timing variation. */
+    uint32_t stream_chunk = STREAM_DMA_BUF;
+
+    /* Configure TX-only DMA with computed chunk size.
      * config_xfer resets DMACTRL, so set DMACTRL after. */
-    if (pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, STREAM_DMA_BUF, 1) < 0) {
+    if (pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, stream_chunk, 1) < 0) {
         fprintf(stderr, "rp1_jtag: streaming config_xfer failed\n");
         ret = RP1_JTAG_ERR_IO;
         goto cleanup;
     }
     pio_sm_set_dmactrl(pio, sm0, true, DMACTRL_DEFAULT);
 
-    /* Streaming mode: X = 0xFFFFFFFF (~4 billion iterations),
-     * jump to loop body (offset+2) to skip pull/out x,32 preamble.
+    /* jtag_stream uses .wrap — no count word, no jmp needed.
+     * SM starts at offset_stream and loops via hardware wrap.
      * SM stalls on autopull at out pins,1 when TX FIFO empties. */
-    pio_sm_exec(pio, sm0, pio_encode_mov_not(pio_x, pio_null));
-    pio_sm_exec(pio, sm0, pio_encode_jmp(jtag->offset0 + 2));
     pio_sm_set_enabled(pio, sm0, true);
 
     /* Record SM enable time for drain calculation */
     struct timespec t_enable;
     clock_gettime(CLOCK_MONOTONIC, &t_enable);
 
-    /* TX DMA: loop over STREAM_DMA_BUF chunks (28B = 7 words).
-     * Each chunk fits within the 8-word TX FIFO without overflow. */
+    /* TX DMA: loop over chunks sized to SM drain rate. */
     {
         uint8_t *ptr = (uint8_t *)tx_buf;
         size_t remaining = tx_bytes;
 
         while (remaining > 0) {
-            size_t chunk = remaining > STREAM_DMA_BUF ? STREAM_DMA_BUF : remaining;
+            size_t chunk = remaining > stream_chunk ? stream_chunk : remaining;
             errno = 0;
             int rc = pio_sm_xfer_data(pio, sm0, PIO_DIR_TO_SM, chunk, ptr);
             if (rc < 0) {
@@ -536,25 +541,19 @@ static int jtag_shift_streaming(rp1_jtag_t *jtag, uint32_t num_bits,
     }
 
     /* Wait for SM to drain remaining FIFO + OSR data.
-     * After the last xfer_data returns, up to 8 FIFO words + 1 OSR
-     * word (= 288 bits) may still be in flight. */
+     * With DREQ-paced DMA, xfer_data blocks until data is written
+     * to the FIFO.  After the last call returns, at most 16 joined
+     * FIFO words + 1 OSR word (= 544 bits) are still in flight.
+     * Sleep for their drain time with generous margin. */
     if (ret == 0) {
-        float div = (float)RP1_PIO_CLK_HZ /
-                    ((float)jtag->freq_hz * INSTR_PER_BIT);
-        if (div < 1.0f) div = 1.0f;
-
-        double total_ns = (double)stream_bits * INSTR_PER_BIT * div
-                          / RP1_PIO_CLK_HZ * 1e9;
-        total_ns = total_ns * 1.1 + 1000000.0;
-
-        struct timespec deadline;
-        deadline.tv_sec = t_enable.tv_sec + (long)(total_ns / 1e9);
-        deadline.tv_nsec = t_enable.tv_nsec + (long)((long long)total_ns % (long long)1000000000);
-        if (deadline.tv_nsec >= 1000000000) {
-            deadline.tv_sec += 1;
-            deadline.tv_nsec -= 1000000000;
-        }
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL);
+        double drain_bits = (16 + 1) * 32.0;  /* joined FIFO + OSR */
+        double drain_ns = drain_bits * STREAM_INSTR_PER_BIT
+                          * stream_div / RP1_PIO_CLK_HZ * 1e9;
+        drain_ns = drain_ns * 2.0 + 1000000.0;  /* 2× margin + 1ms */
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = (long)drain_ns;
+        clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
     }
 
 cleanup:
@@ -848,6 +847,17 @@ rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
         return NULL;
     }
 
+    /* Load jtag_stream program (2 instructions, used by streaming path) */
+    uint offset_stream = pio_add_program(pio, &jtag_stream_program);
+    if (offset_stream == PIO_ORIGIN_INVALID) {
+        fprintf(stderr, "rp1_jtag: failed to load jtag_stream program\n");
+        pio_remove_program(pio, &jtag_shift_program, offset0);
+        pio_sm_unclaim(pio, (uint)sm1);
+        pio_sm_unclaim(pio, (uint)sm0);
+        pio_close(pio);
+        return NULL;
+    }
+
     /* Select PIO instance for sm_config_set_* functions */
     pio_select(pio);
 
@@ -923,6 +933,7 @@ rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
     jtag->sm0 = sm0;
     jtag->sm1 = sm1;
     jtag->offset0 = offset0;
+    jtag->offset_stream = offset_stream;
     jtag->offset1 = 0;  /* no TMS program loaded */
 
     return jtag;
@@ -1006,6 +1017,7 @@ void rp1_jtag_close(rp1_jtag_t *jtag)
     /* Remove programs from instruction memory */
     if (jtag->mode == MODE_JTAG) {
         pio_remove_program(pio, &jtag_shift_program, jtag->offset0);
+        pio_remove_program(pio, &jtag_stream_program, jtag->offset_stream);
     } else {
         pio_remove_program(pio, &jtag_loopback_program, jtag->offset0);
     }

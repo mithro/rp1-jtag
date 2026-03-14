@@ -31,8 +31,9 @@
  * single-word (4 byte) transfers time out on RP1. */
 #define MIN_DMA_BYTES           8
 
-/* PIO instructions per JTAG bit (jtag_shift program: 4 instruction loop) */
-#define INSTR_PER_BIT           4
+/* PIO instructions per JTAG bit */
+#define INSTR_PER_BIT           4   /* jtag_shift: out/nop/in/jmp */
+#define STREAM_INSTR_PER_BIT    2   /* jtag_stream: out/in (wrap) */
 
 /* Maximum bits per DMA transfer chunk (sequential path).
  *
@@ -62,7 +63,8 @@ struct rp1_jtag {
     void *pio;              /* PIO instance (PIO type from PIOLib) */
     int sm0;                /* SM0: TDI/TDO/TCK */
     int sm1;                /* SM1: TMS (-1 in loopback mode) */
-    unsigned int offset0;   /* SM0 program offset in instruction memory */
+    unsigned int offset0;   /* SM0 program offset (jtag_shift) */
+    unsigned int offset_stream; /* SM0 program offset (jtag_stream) */
     unsigned int offset1;   /* SM1 program offset in instruction memory */
 };
 
