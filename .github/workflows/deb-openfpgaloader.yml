@@ -8,12 +8,8 @@ jobs:
   build-deb:
     name: deb (${{ matrix.distro }} ${{ matrix.arch }})
     runs-on: ubuntu-24.04-arm
-    container:
-      image: debian:${{ matrix.distro }}
-      # On the AArch64 runner, --platform linux/arm/v7 gives an armhf
-      # userland that the CPU executes natively in AArch32 compat mode
-      # (no qemu emulation), so the armhf build is as fast as arm64.
-      options: --platform ${{ matrix.platform }}
+    # No job-level container — see comment on deb-rp1jtag.yml for the
+    # rationale (cross-arch container + arm64 node binary mismatch).
     strategy:
       fail-fast: false
       matrix:
@@ -26,75 +22,69 @@ jobs:
             platform: linux/arm/v7
 
     steps:
-      - name: Install build tooling
-        run: |
-          apt-get update
-          apt-get install -y \
-            build-essential cmake git pkg-config python3 \
-            libftdi1-dev libusb-1.0-0-dev zlib1g-dev \
-            libhidapi-dev libudev-dev
-
       - name: Checkout rp1-jtag
         uses: actions/checkout@v4
         with:
           path: rp1-jtag
 
-      - name: Build and install librp1jtag
-        working-directory: rp1-jtag
+      - name: Build openfpgaloader-rp1pio .deb in debian:${{ matrix.distro }} (${{ matrix.arch }})
         run: |
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr
-          cmake --build build --parallel
-          cmake --install build
-          ldconfig
+          docker run --rm \
+            --platform ${{ matrix.platform }} \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            debian:${{ matrix.distro }} bash -ec '
+              apt-get update
+              apt-get install -y build-essential cmake git pkg-config python3 \
+                libftdi1-dev libusb-1.0-0-dev zlib1g-dev \
+                libhidapi-dev libudev-dev
 
-      - name: Clone openFPGALoader
-        run: git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git
+              cmake -B rp1-jtag/build -S rp1-jtag \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr
+              cmake --build rp1-jtag/build --parallel
+              cmake --install rp1-jtag/build
+              ldconfig
 
-      - name: Patch openFPGALoader with rp1-jtag driver
-        run: python3 rp1-jtag/drivers/openfpgaloader/integrate.py openFPGALoader
+              git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git
+              python3 rp1-jtag/drivers/openfpgaloader/integrate.py openFPGALoader
+              cmake -B openFPGALoader/build -S openFPGALoader \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DENABLE_RP1_PIO=ON \
+                -DCMAKE_INSTALL_PREFIX=/usr
+              cmake --build openFPGALoader/build --parallel
 
-      - name: Build openFPGALoader
-        run: |
-          cmake -B openFPGALoader/build -S openFPGALoader \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_RP1_PIO=ON \
-            -DCMAKE_INSTALL_PREFIX=/usr
-          cmake --build openFPGALoader/build --parallel
+              OFL_DATE=$(date -u +%Y%m%d)
+              PKG_VERSION="0.0.1~git${OFL_DATE}"
+              ARCH=$(dpkg --print-architecture)
 
-      - name: Create .deb package
-        run: |
-          OFL_DATE=$(date -u +%Y%m%d)
-          PKG_VERSION="0.0.1~git${OFL_DATE}"
-          ARCH=$(dpkg --print-architecture)
+              PKG_DIR="openfpgaloader-rp1pio_${PKG_VERSION}_${ARCH}"
+              mkdir -p "${PKG_DIR}/DEBIAN"
+              mkdir -p "${PKG_DIR}/usr/bin"
+              mkdir -p "${PKG_DIR}/usr/share/doc/openfpgaloader-rp1pio"
 
-          PKG_DIR="openfpgaloader-rp1pio_${PKG_VERSION}_${ARCH}"
-          mkdir -p "${PKG_DIR}/DEBIAN"
-          mkdir -p "${PKG_DIR}/usr/bin"
-          mkdir -p "${PKG_DIR}/usr/share/doc/openfpgaloader-rp1pio"
+              cp openFPGALoader/build/openFPGALoader "${PKG_DIR}/usr/bin/openFPGALoader"
 
-          cp openFPGALoader/build/openFPGALoader "${PKG_DIR}/usr/bin/openFPGALoader"
+              # Write control file without indentation issues
+              printf "%s\n" \
+                "Package: openfpgaloader-rp1pio" \
+                "Version: ${PKG_VERSION}" \
+                "Architecture: ${ARCH}" \
+                "Maintainer: Tim Ansell <tim@mithis.com>" \
+                "Depends: librp1jtag0 (>= 0.1.0), libftdi1-2, libusb-1.0-0, zlib1g, libhidapi-hidraw0, libudev1" \
+                "Section: electronics" \
+                "Priority: optional" \
+                "Homepage: https://github.com/mithro/rp1-jtag" \
+                "Description: openFPGALoader with RP1 PIO JTAG support" \
+                " openFPGALoader built with the rp1pio cable driver for high-speed" \
+                " JTAG via the Raspberry Pi 5 RP1 PIO block." \
+                > "${PKG_DIR}/DEBIAN/control"
 
-          # Write control file without indentation issues
-          printf '%s\n' \
-            "Package: openfpgaloader-rp1pio" \
-            "Version: ${PKG_VERSION}" \
-            "Architecture: ${ARCH}" \
-            "Maintainer: Tim Ansell <tim@mithis.com>" \
-            "Depends: librp1jtag0 (>= 0.1.0), libftdi1-2, libusb-1.0-0, zlib1g, libhidapi-hidraw0, libudev1" \
-            "Section: electronics" \
-            "Priority: optional" \
-            "Homepage: https://github.com/mithro/rp1-jtag" \
-            "Description: openFPGALoader with RP1 PIO JTAG support" \
-            " openFPGALoader built with the rp1pio cable driver for high-speed" \
-            " JTAG via the Raspberry Pi 5 RP1 PIO block." \
-            > "${PKG_DIR}/DEBIAN/control"
+              cp rp1-jtag/LICENSE "${PKG_DIR}/usr/share/doc/openfpgaloader-rp1pio/copyright"
 
-          cp rp1-jtag/LICENSE "${PKG_DIR}/usr/share/doc/openfpgaloader-rp1pio/copyright"
-
-          dpkg-deb --build "${PKG_DIR}"
-          ls -lh "${PKG_DIR}.deb"
+              dpkg-deb --build "${PKG_DIR}"
+              ls -lh "${PKG_DIR}.deb"
+            '
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
