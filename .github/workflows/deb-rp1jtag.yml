@@ -6,13 +6,24 @@ on:
 
 jobs:
   build-deb:
-    name: deb (${{ matrix.distro }})
+    name: deb (${{ matrix.distro }} ${{ matrix.arch }})
     runs-on: ubuntu-24.04-arm
-    container: debian:${{ matrix.distro }}
+    container:
+      image: debian:${{ matrix.distro }}
+      # On the AArch64 runner, --platform linux/arm/v7 gives an armhf
+      # userland that the CPU executes natively in AArch32 compat mode
+      # (no qemu emulation), so the armhf build is as fast as arm64.
+      options: --platform ${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
         distro: [bookworm, trixie]
+        arch: [arm64, armhf]
+        include:
+          - arch: arm64
+            platform: linux/arm64
+          - arch: armhf
+            platform: linux/arm/v7
 
     steps:
       - name: Install build tooling
@@ -36,5 +47,5 @@ jobs:
       - name: Upload debs
         uses: actions/upload-artifact@v4
         with:
-          name: debs-rp1jtag-${{ matrix.distro }}
+          name: debs-rp1jtag-${{ matrix.distro }}-${{ matrix.arch }}
           path: built-debs/*.deb
