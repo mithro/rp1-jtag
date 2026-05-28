@@ -6,35 +6,49 @@ on:
 
 jobs:
   build-deb:
-    name: deb (${{ matrix.distro }})
+    name: deb (${{ matrix.distro }} ${{ matrix.arch }})
     runs-on: ubuntu-24.04-arm
-    container: debian:${{ matrix.distro }}
+    # No job-level container: with a cross-architecture container (armhf
+    # userland on the aarch64 runner) the runner's mounted node binary
+    # (arm64, needs /lib/ld-linux-aarch64.so.1) can't execute inside an
+    # armhf rootfs, so JS-based actions like actions/checkout fail with
+    # `exec /__e/node20/bin/node: no such file or directory`. We
+    # therefore checkout on the runner host (native arm64 node works)
+    # and only run the build inside `docker run --platform …`.
     strategy:
       fail-fast: false
       matrix:
         distro: [bookworm, trixie]
+        arch: [arm64, armhf]
+        include:
+          - arch: arm64
+            platform: linux/arm64
+          - arch: armhf
+            platform: linux/arm/v7
 
     steps:
-      - name: Install build tooling
-        run: |
-          apt-get update
-          apt-get install -y \
-            build-essential cmake debhelper fakeroot git
-
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build Debian packages
-        run: dpkg-buildpackage -us -uc -b
-
-      - name: Collect built packages
+      - name: Build .deb in debian:${{ matrix.distro }} (${{ matrix.arch }})
         run: |
           mkdir -p built-debs
-          cp ../*.deb built-debs/
-          ls -lh built-debs/
+          docker run --rm \
+            --platform ${{ matrix.platform }} \
+            -v "$GITHUB_WORKSPACE:/work/src" \
+            -v "$GITHUB_WORKSPACE/built-debs:/work/out" \
+            -w /work/src \
+            debian:${{ matrix.distro }} bash -ec '
+              apt-get update
+              apt-get install -y build-essential cmake debhelper fakeroot git
+              dpkg-buildpackage -us -uc -b
+              # dpkg-buildpackage emits .debs into the parent dir (/work).
+              cp /work/*.deb /work/out/
+              ls -lh /work/out/
+            '
 
       - name: Upload debs
         uses: actions/upload-artifact@v4
         with:
-          name: debs-rp1jtag-${{ matrix.distro }}
+          name: debs-rp1jtag-${{ matrix.distro }}-${{ matrix.arch }}
           path: built-debs/*.deb
