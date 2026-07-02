@@ -165,21 +165,8 @@ def main() -> None:
         "CMake sources",
     )
 
-    # Add USE_DEVICE_ARG support (so --pins/--device CLI args work)
-    cmake = replace_once(
-        cmake,
-        'if (ENABLE_UDEV OR ENABLE_LIBGPIOD OR ENABLE_JETSONNANOGPIO)\n'
-        '\tadd_definitions(-DUSE_DEVICE_ARG)',
-        'if (ENABLE_UDEV OR ENABLE_LIBGPIOD OR ENABLE_JETSONNANOGPIO OR ENABLE_RP1_PIO)\n'
-        '\tadd_definitions(-DUSE_DEVICE_ARG)',
-        "CMake USE_DEVICE_ARG (if)",
-    )
-    cmake = replace_once(
-        cmake,
-        'endif(ENABLE_UDEV OR ENABLE_LIBGPIOD OR ENABLE_JETSONNANOGPIO)',
-        'endif(ENABLE_UDEV OR ENABLE_LIBGPIOD OR ENABLE_JETSONNANOGPIO OR ENABLE_RP1_PIO)',
-        "CMake USE_DEVICE_ARG (endif)",
-    )
+    # (No USE_DEVICE_ARG patch: upstream made --device/-d unconditional
+    # and removed the macro, so the previous ENABLE_RP1_PIO gate is moot.)
 
     # Add link libraries after the last LIBGPIOD endif block
     # The linking section is near the end of the file (after target_link_libraries)
