@@ -57,6 +57,7 @@ jobs:
               apt-get update
               apt-get install -y --no-install-recommends \
                 build-essential cmake debhelper fakeroot git pkg-config python3 \
+                ca-certificates \
                 libftdi1-dev libusb-1.0-0-dev zlib1g-dev libhidapi-dev libudev-dev
 
               git config --global --add safe.directory /work/src
