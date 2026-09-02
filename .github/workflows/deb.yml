@@ -17,10 +17,11 @@ on:
 
 # A reusable workflow cannot escalate beyond the permissions its caller was
 # granted, so the Pages permissions the publish job needs must be granted here.
+# Least privilege by default: only the publish job below raises this, and only
+# for itself. The build jobs run Docker and clone third-party sources, so they
+# should never hold a token that can write to Pages.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 jobs:
   build:
@@ -123,6 +124,13 @@ jobs:
           if-no-files-found: error
 
   publish:
+    # Scoped to this job alone. A job calling a reusable workflow sets the
+    # maximum permissions available to it, so the elevated Pages scopes stay
+    # here rather than applying to the whole workflow.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     # Pull requests build but must not publish: they would overwrite the live
     # repository with packages from unreviewed code.
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
