@@ -51,10 +51,11 @@ jobs:
               cd /work
 
               # Build and install PIOLib (provides /dev/pio0 hardware access).
-              # Only the library target and its install component: piolib's
+              # Only the library target and its install component: the piolib
               # examples (irqtest, irqtest2) link against gpiolib from the
               # sibling pinctrl/ tree, which is not built when piolib is
               # configured standalone, so a full build fails at link time.
+              # NOTE: no apostrophes in this script, it is single-quoted.
               git clone --depth 1 https://github.com/raspberrypi/utils.git /work/rpi-utils
               cmake -B /work/rpi-utils/piolib/build /work/rpi-utils/piolib \
                 -DCMAKE_BUILD_TYPE=Release \
