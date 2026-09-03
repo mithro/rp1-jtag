@@ -27,9 +27,8 @@ MARKER = "rp1_pio_jtag"
 
 def insert_before(content: str, anchor: str, block: str, marker: str) -> str:
     """Insert block BEFORE the first occurrence of anchor."""
-    # Skip if block's key content is already present
-    key_lines = [l.strip() for l in block.strip().split('\n') if l.strip()]
-    if key_lines and any(l in content for l in key_lines[1:2]):
+    # Idempotency: the exact block already sits in front of the anchor.
+    if block + anchor in content:
         print(f"  {marker}: already applied, skipping")
         return content
     idx = content.find(anchor)
@@ -44,8 +43,11 @@ def insert_before(content: str, anchor: str, block: str, marker: str) -> str:
 
 def insert_after(content: str, anchor: str, block: str, marker: str) -> str:
     """Insert block AFTER the first occurrence of anchor."""
-    key_lines = [l.strip() for l in block.strip().split('\n') if l.strip()]
-    if key_lines and key_lines[0] in content:
+    # Idempotency: the exact block already follows the anchor. Matching a
+    # single stripped line is not enough: the AC_ARG_ADAPTERS and summary
+    # entries are the same text at different indentation, so the second
+    # was wrongly skipped once the first had been applied.
+    if anchor + block in content:
         print(f"  {marker}: already applied, skipping")
         return content
     idx = content.find(anchor)
