@@ -66,6 +66,22 @@ jobs:
               VERSION="$(python3 packaging/deb-version.py --write-changelog)"
               echo "building version $VERSION"
 
+              # PIOLib (raspberrypi/utils) is the /dev/pio0 backend of
+              # librp1jtag. Debian does not package it, so build it here and
+              # let librp1jtag link it statically: without it CMake reports
+              # "PIOLib not found" and builds a stub backend, and every tool
+              # then fails with "rp1_jtag: compiled without PIOLib support".
+              # Only the library target: the piolib examples link against
+              # gpiolib from the sibling pinctrl/ tree, which is not built
+              # when piolib is configured standalone.
+              git clone --depth 1 https://github.com/raspberrypi/utils.git /work/rpi-utils
+              cmake -B /work/rpi-utils/piolib/build -S /work/rpi-utils/piolib \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr \
+                -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+              cmake --build /work/rpi-utils/piolib/build --parallel --target pio
+              cmake --install /work/rpi-utils/piolib/build --component piolib
+
               # 1. librp1jtag0 / librp1jtag-dev, from debian/.
               dpkg-buildpackage -us -uc -b
               cp /work/*.deb /work/out/
@@ -74,6 +90,13 @@ jobs:
               # install it rather than a stale archive copy.
               dpkg -i /work/librp1jtag0_*.deb /work/librp1jtag-dev_*.deb
               ldconfig
+
+              # Never ship the stub backend again: the string below only
+              # exists in a librp1jtag built without PIOLib.
+              if strings /usr/lib/*/librp1jtag.so.0 | grep -q "compiled without PIOLib support"; then
+                echo "ERROR: librp1jtag0 was built without PIOLib" >&2
+                exit 1
+              fi
 
               # 2. openFPGALoader with the rp1pio cable driver.
               git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git
@@ -91,6 +114,12 @@ jobs:
               cp openFPGALoader/build/openFPGALoader "$PKG/usr/bin/openFPGALoader"
               cp LICENSE "$PKG/usr/share/doc/openfpgaloader-rp1pio/copyright"
 
+              # Depends from the linked shared libraries, as dh would compute.
+              # The hand-written list named libhidapi-hidraw0 while the binary
+              # links libhidapi-libusb, so the package installed but failed to
+              # start with a missing shared library.
+              DEPENDS="$(dpkg-shlibdeps -O -e "$PKG/usr/bin/openFPGALoader" | sed "s/^shlibs:Depends=//")"
+
               # Debian ships /usr/bin/openFPGALoader in its own openfpgaloader
               # package. Without Conflicts/Replaces dpkg refuses to unpack over
               # it, which forces consumers to remove it by hand first.
@@ -99,7 +128,7 @@ jobs:
                 "Version: ${VERSION}" \
                 "Architecture: ${ARCH}" \
                 "Maintainer: Tim Ansell <me@mith.ro>" \
-                "Depends: librp1jtag0 (>= ${VERSION}), libftdi1-2, libusb-1.0-0, zlib1g, libhidapi-hidraw0, libudev1" \
+                "Depends: ${DEPENDS}" \
                 "Conflicts: openfpgaloader" \
                 "Replaces: openfpgaloader" \
                 "Provides: openfpgaloader" \
@@ -166,6 +195,22 @@ jobs:
               git config --global --add safe.directory /work/src
               VERSION="$(python3 packaging/deb-version.py --write-changelog)"
               echo "building version $VERSION"
+
+              # PIOLib (raspberrypi/utils) is the /dev/pio0 backend of
+              # librp1jtag. Debian does not package it, so build it here and
+              # let librp1jtag link it statically: without it CMake reports
+              # "PIOLib not found" and builds a stub backend, and every tool
+              # then fails with "rp1_jtag: compiled without PIOLib support".
+              # Only the library target: the piolib examples link against
+              # gpiolib from the sibling pinctrl/ tree, which is not built
+              # when piolib is configured standalone.
+              git clone --depth 1 https://github.com/raspberrypi/utils.git /work/rpi-utils
+              cmake -B /work/rpi-utils/piolib/build -S /work/rpi-utils/piolib \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr \
+                -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+              cmake --build /work/rpi-utils/piolib/build --parallel --target pio
+              cmake --install /work/rpi-utils/piolib/build --component piolib
 
               # 1. librp1jtag, which OpenOCD links against. The build job publishes
               #    these packages; here they are only installed so the versions match.
