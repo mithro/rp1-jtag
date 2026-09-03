@@ -1,8 +1,9 @@
 name: Debian packages + apt repo
 
-# Rolling release: every push to main builds librp1jtag and the RP1-PIO
-# openFPGALoader for each supported suite, then publishes a signed flat apt
-# repository per suite to GitHub Pages via mithro/apt-repo-action.
+# Rolling release: every push to main builds librp1jtag, the RP1-PIO
+# openFPGALoader and the RP1-PIO OpenOCD for each supported suite, then
+# publishes a signed flat apt repository per suite to GitHub Pages via
+# mithro/apt-repo-action.
 #
 # Architectures are arm64 and armhf only: librp1jtag drives the RP1 on a
 # Raspberry Pi 5, so amd64 and riscv64 builds would have nothing to run on.
@@ -123,6 +124,113 @@ jobs:
           path: built-debs/*.deb
           if-no-files-found: error
 
+  build-openocd:
+    name: openocd deb (${{ matrix.suite }} ${{ matrix.arch }})
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [bookworm, trixie, sid]
+        arch: [arm64, armhf]
+        include:
+          - arch: arm64
+            platform: linux/arm64
+          - arch: armhf
+            platform: linux/arm/v7
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags so deb-version.py can describe
+
+      - name: Build openocd-rp1pio
+        env:
+          SUITE: ${{ matrix.suite }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -eux
+          mkdir -p built-debs
+          docker run --rm --platform "$PLATFORM" \
+            -v "$GITHUB_WORKSPACE:/work/src" \
+            -v "$GITHUB_WORKSPACE/built-debs:/work/out" \
+            -w /work/src \
+            "debian:$SUITE" bash -ec '
+              set -eux
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential cmake debhelper fakeroot git pkg-config python3 \
+                ca-certificates autoconf automake libtool texinfo \
+                libusb-1.0-0-dev libftdi1-dev libhidapi-dev libjim-dev libgpiod-dev \
+                libcapstone-dev
+
+              git config --global --add safe.directory /work/src
+              VERSION="$(python3 packaging/deb-version.py --write-changelog)"
+              echo "building version $VERSION"
+
+              # 1. librp1jtag, which OpenOCD links against. The build job publishes
+              #    these packages; here they are only installed so the versions match.
+              dpkg-buildpackage -us -uc -b
+              dpkg -i /work/librp1jtag0_*.deb /work/librp1jtag-dev_*.deb
+              ldconfig
+
+              # 2. OpenOCD with the rp1_pio_jtag adapter driver.
+              git clone --depth 1 https://github.com/openocd-org/openocd.git
+              python3 drivers/openocd/integrate.py openocd
+              cd openocd
+              ./bootstrap nosubmodule
+              ./configure --prefix=/usr --enable-rp1-pio-jtag --disable-werror
+              make -j"$(nproc)"
+              cd ..
+
+              ARCH="$(dpkg --print-architecture)"
+              PKG="openocd-rp1pio_${VERSION}_${ARCH}"
+              make -C openocd install DESTDIR="/work/src/$PKG"
+              strip --strip-unneeded "$PKG/usr/bin/openocd"
+              install -m 0644 -D -t "$PKG/usr/share/openocd/scripts/board" \
+                drivers/openocd/netv2_35t.cfg drivers/openocd/netv2_35t_spi.cfg
+              install -m 0644 -D -t "$PKG/usr/lib/udev/rules.d" openocd/contrib/60-openocd.rules
+              install -m 0644 -D openocd/COPYING "$PKG/usr/share/doc/openocd-rp1pio/copyright"
+
+              # Depends from the linked shared libraries, as dh would compute; the
+              # runtime library set differs between suites (libjim, libgpiod, ...).
+              DEPENDS="$(dpkg-shlibdeps -O -e "$PKG/usr/bin/openocd" | sed "s/^shlibs:Depends=//")"
+
+              # Debian ships /usr/bin/openocd in its own openocd package; see the
+              # openfpgaloader-rp1pio control above for why Conflicts/Replaces matter.
+              mkdir -p "$PKG/DEBIAN"
+              printf "%s\n" \
+                "Package: openocd-rp1pio" \
+                "Version: ${VERSION}" \
+                "Architecture: ${ARCH}" \
+                "Maintainer: Tim Ansell <me@mith.ro>" \
+                "Depends: ${DEPENDS}" \
+                "Conflicts: openocd" \
+                "Replaces: openocd" \
+                "Provides: openocd" \
+                "Section: embedded" \
+                "Priority: optional" \
+                "Homepage: https://github.com/mithro/rp1-jtag" \
+                "Description: OpenOCD with RP1 PIO JTAG support" \
+                " OpenOCD (git master) built with the rp1_pio_jtag adapter driver for" \
+                " high-speed JTAG via the Raspberry Pi 5 RP1 PIO block. Includes NeTV2" \
+                " board configs: board/netv2_35t.cfg and board/netv2_35t_spi.cfg." \
+                > "$PKG/DEBIAN/control"
+
+              dpkg-deb --build "$PKG"
+              cp "${PKG}.deb" /work/out/
+              ls -lh /work/out/
+            '
+
+      # The publish workflow derives the suite from the artifact name as the
+      # text between "debs-" and the next dash, so a trailing "-openocd"
+      # keeps this distinct from the build job artifact for the same
+      # suite/arch while still landing in the same suite directory.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ matrix.suite }}-${{ matrix.arch }}-openocd
+          path: built-debs/openocd-rp1pio_*.deb
+          if-no-files-found: error
+
   publish:
     # Scoped to this job alone. A job calling a reusable workflow sets the
     # maximum permissions available to it, so the elevated Pages scopes stay
@@ -134,7 +242,7 @@ jobs:
     # Pull requests build but must not publish: they would overwrite the live
     # repository with packages from unreviewed code.
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    needs: build
+    needs: [build, build-openocd]
     uses: mithro/apt-repo-action/.github/workflows/publish-apt.yml@main
     with:
       suites: "bookworm trixie sid"
