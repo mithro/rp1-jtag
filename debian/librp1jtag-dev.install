@@ -1,3 +1,4 @@
 usr/include/rp1_jtag.h
 usr/lib/*/librp1jtag.a
 usr/lib/*/librp1jtag.so
+usr/lib/*/pkgconfig/rp1jtag.pc
