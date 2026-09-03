@@ -50,14 +50,18 @@ jobs:
               make install
               cd /work
 
-              # Build and install PIOLib (provides /dev/pio0 hardware access)
+              # Build and install PIOLib (provides /dev/pio0 hardware access).
+              # Only the library target and its install component: piolib's
+              # examples (irqtest, irqtest2) link against gpiolib from the
+              # sibling pinctrl/ tree, which is not built when piolib is
+              # configured standalone, so a full build fails at link time.
               git clone --depth 1 https://github.com/raspberrypi/utils.git /work/rpi-utils
               cmake -B /work/rpi-utils/piolib/build /work/rpi-utils/piolib \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX=/usr \
                 -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-              cmake --build /work/rpi-utils/piolib/build --parallel
-              cmake --install /work/rpi-utils/piolib/build
+              cmake --build /work/rpi-utils/piolib/build --parallel --target pio
+              cmake --install /work/rpi-utils/piolib/build --component piolib
 
               # Build and install librp1jtag (with PIOLib support)
               cmake -B /work/rp1-jtag/build /work/rp1-jtag \
