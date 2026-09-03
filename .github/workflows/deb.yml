@@ -1,0 +1,145 @@
+name: Debian packages + apt repo
+
+# Rolling release: every push to main builds librp1jtag and the RP1-PIO
+# openFPGALoader for each supported suite, then publishes a signed flat apt
+# repository per suite to GitHub Pages via mithro/apt-repo-action.
+#
+# Architectures are arm64 and armhf only: librp1jtag drives the RP1 on a
+# Raspberry Pi 5, so amd64 and riscv64 builds would have nothing to run on.
+#
+# bookworm is built as well as trixie/sid because fpgas.online consumes these
+# packages and its Pi NFS root is still Raspberry Pi OS bookworm.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A reusable workflow cannot escalate beyond the permissions its caller was
+# granted, so the Pages permissions the publish job needs must be granted here.
+# Least privilege by default: only the publish job below raises this, and only
+# for itself. The build jobs run Docker and clone third-party sources, so they
+# should never hold a token that can write to Pages.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: deb (${{ matrix.suite }} ${{ matrix.arch }})
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [bookworm, trixie, sid]
+        arch: [arm64, armhf]
+        include:
+          - arch: arm64
+            platform: linux/arm64
+          - arch: armhf
+            platform: linux/arm/v7
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags so deb-version.py can describe
+
+      - name: Build librp1jtag and openfpgaloader-rp1pio
+        env:
+          SUITE: ${{ matrix.suite }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -eux
+          mkdir -p built-debs
+          docker run --rm --platform "$PLATFORM" \
+            -v "$GITHUB_WORKSPACE:/work/src" \
+            -v "$GITHUB_WORKSPACE/built-debs:/work/out" \
+            -w /work/src \
+            "debian:$SUITE" bash -ec '
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential cmake debhelper fakeroot git pkg-config python3 \
+                ca-certificates \
+                libftdi1-dev libusb-1.0-0-dev zlib1g-dev libhidapi-dev libudev-dev
+
+              git config --global --add safe.directory /work/src
+              VERSION="$(python3 packaging/deb-version.py --write-changelog)"
+              echo "building version $VERSION"
+
+              # 1. librp1jtag0 / librp1jtag-dev, from debian/.
+              dpkg-buildpackage -us -uc -b
+              cp /work/*.deb /work/out/
+
+              # openFPGALoader links against the library we just built, so
+              # install it rather than a stale archive copy.
+              dpkg -i /work/librp1jtag0_*.deb /work/librp1jtag-dev_*.deb
+              ldconfig
+
+              # 2. openFPGALoader with the rp1pio cable driver.
+              git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git
+              python3 drivers/openfpgaloader/integrate.py openFPGALoader
+              cmake -B openFPGALoader/build -S openFPGALoader \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DENABLE_RP1_PIO=ON \
+                -DCMAKE_INSTALL_PREFIX=/usr
+              cmake --build openFPGALoader/build --parallel
+
+              ARCH="$(dpkg --print-architecture)"
+              PKG="openfpgaloader-rp1pio_${VERSION}_${ARCH}"
+              mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" \
+                       "$PKG/usr/share/doc/openfpgaloader-rp1pio"
+              cp openFPGALoader/build/openFPGALoader "$PKG/usr/bin/openFPGALoader"
+              cp LICENSE "$PKG/usr/share/doc/openfpgaloader-rp1pio/copyright"
+
+              # Debian ships /usr/bin/openFPGALoader in its own openfpgaloader
+              # package. Without Conflicts/Replaces dpkg refuses to unpack over
+              # it, which forces consumers to remove it by hand first.
+              printf "%s\n" \
+                "Package: openfpgaloader-rp1pio" \
+                "Version: ${VERSION}" \
+                "Architecture: ${ARCH}" \
+                "Maintainer: Tim Ansell <me@mith.ro>" \
+                "Depends: librp1jtag0 (>= ${VERSION}), libftdi1-2, libusb-1.0-0, zlib1g, libhidapi-hidraw0, libudev1" \
+                "Conflicts: openfpgaloader" \
+                "Replaces: openfpgaloader" \
+                "Provides: openfpgaloader" \
+                "Section: electronics" \
+                "Priority: optional" \
+                "Homepage: https://github.com/mithro/rp1-jtag" \
+                "Description: openFPGALoader with RP1 PIO JTAG support" \
+                " openFPGALoader built with the rp1pio cable driver for high-speed" \
+                " JTAG via the Raspberry Pi 5 RP1 PIO block. Also carries the" \
+                " --read-dna, --read-xadc and --read-register support absent from" \
+                " the openfpgaloader package in Debian bookworm." \
+                > "$PKG/DEBIAN/control"
+
+              dpkg-deb --build "$PKG"
+              cp "${PKG}.deb" /work/out/
+              ls -lh /work/out/
+            '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ matrix.suite }}-${{ matrix.arch }}
+          path: built-debs/*.deb
+          if-no-files-found: error
+
+  publish:
+    # Scoped to this job alone. A job calling a reusable workflow sets the
+    # maximum permissions available to it, so the elevated Pages scopes stay
+    # here rather than applying to the whole workflow.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    # Pull requests build but must not publish: they would overwrite the live
+    # repository with packages from unreviewed code.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: build
+    uses: mithro/apt-repo-action/.github/workflows/publish-apt.yml@main
+    with:
+      suites: "bookworm trixie sid"
+      architectures: "arm64 armhf"
+      keyring-name: rp1-jtag.gpg
+      description: "High-speed JTAG via the Raspberry Pi 5 RP1 PIO block"
+    secrets:
+      gpg-private-key: ${{ secrets.APT_GPG_PRIVATE_KEY }}
