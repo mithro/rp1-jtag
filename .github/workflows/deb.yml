@@ -60,7 +60,8 @@ jobs:
               apt-get install -y --no-install-recommends \
                 build-essential cmake debhelper fakeroot git pkg-config python3 \
                 ca-certificates \
-                libftdi1-dev libusb-1.0-0-dev zlib1g-dev libhidapi-dev libudev-dev
+                libftdi1-dev libusb-1.0-0-dev zlib1g-dev libhidapi-dev libudev-dev \
+                libgpiod-dev
 
               git config --global --add safe.directory /work/src
               VERSION="$(python3 packaging/deb-version.py --write-changelog)"
@@ -101,11 +102,26 @@ jobs:
               # 2. openFPGALoader with the rp1pio cable driver.
               git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git
               python3 drivers/openfpgaloader/integrate.py openFPGALoader
+              # Every cable and vendor openFPGALoader can build on Linux.
+              # ENABLE_CABLE_ALL/ENABLE_VENDORS_ALL are the upstream defaults
+              # but are pinned here so a future default change is visible.
+              # libgpiod is the one backend upstream silently disables when
+              # the headers are missing, so it is asserted below: the same
+              # armhf package serves the Pi 3/4 hosts that program NeTV2 over
+              # GPIO bitbang JTAG and have no RP1.
               cmake -B openFPGALoader/build -S openFPGALoader \
                 -DCMAKE_BUILD_TYPE=Release \
+                -DENABLE_CABLE_ALL=ON \
+                -DENABLE_VENDORS_ALL=ON \
+                -DENABLE_LIBGPIOD=ON \
+                -DENABLE_UDEV=ON \
+                -DENABLE_USB_SCAN=ON \
                 -DENABLE_RP1_PIO=ON \
                 -DCMAKE_INSTALL_PREFIX=/usr
               cmake --build openFPGALoader/build --parallel
+              openFPGALoader/build/openFPGALoader --list-cables | tee cables.txt
+              grep -qw libgpiod cables.txt || { echo "ERROR: libgpiod cable missing" >&2; exit 1; }
+              grep -qw rp1pio cables.txt || { echo "ERROR: rp1pio cable missing" >&2; exit 1; }
 
               ARCH="$(dpkg --print-architecture)"
               PKG="openfpgaloader-rp1pio_${VERSION}_${ARCH}"
