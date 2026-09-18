@@ -14,6 +14,7 @@ name: Debian packages + apt repo
 on:
   push:
     branches: [main]
+  workflow_dispatch:
   pull_request:
 
 # A reusable workflow cannot escalate beyond the permissions its caller was
@@ -301,8 +302,9 @@ jobs:
       pages: write
       id-token: write
     # Pull requests build but must not publish: they would overwrite the live
-    # repository with packages from unreviewed code.
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # repository with packages from unreviewed code. A manual run publishes
+    # only from main.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: [build, build-openocd]
     uses: mithro/apt-repo-action/.github/workflows/publish-apt.yml@main
     with:
