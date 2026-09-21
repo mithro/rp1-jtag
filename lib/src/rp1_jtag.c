@@ -252,14 +252,27 @@ static int switch_program(rp1_jtag_t *jtag, pio_program_id_t prog,
 /* ---- Fast PIO shift (no count word, SM managed by caller) ---- */
 
 /*
- * DMA ping-pong chunk size: 8 words = 32 bytes (matches RP1 FIFO depth).
- * Larger DMA transfers deadlock because the blocking TX DMA fills the
- * TX FIFO but nobody drains the RX FIFO, stalling the SM.
+ * DMA buffer configuration.
  *
- * Note: config_xfer buf_size must also be 32 bytes. Larger values
- * (e.g. 32768) cause PIOLib DMA timeouts even though the actual
- * xfer_data calls only transfer 32 bytes each.
+ * The RP1 kernel driver (rp1-pio.c) uses a ring buffer of bounce buffers
+ * for DMA pipelining. DMA_BUF_SIZE and DMA_BUF_COUNT control this ring:
+ *   - buf_size: bytes per bounce buffer (kernel allocates PAGE_SIZE-aligned)
+ *   - buf_count: number of bounce buffers in the ring (max 4 in kernel)
+ *
+ * With buf_count=4, buf_size=4096, the kernel has 16 KB of in-flight DMA
+ * capacity per direction. A single xfer_data() call pipelines internally:
+ * submits buf_count chunks, blocks when ring is full, refills freed slots.
+ *
+ * The bidi path (xfer_data_bidi) runs TX and RX in separate pthreads.
+ * TX and RX use separate dma_info structs in the kernel — no shared mutex.
+ *
+ * Performance: ~38 MB/s measured with fast_loopback PIO program.
  */
+#define DMA_BUF_SIZE     4096
+#define DMA_BUF_COUNT    4
+
+/* Fallback ping-pong chunk size for single-direction DMA path.
+ * 8 words = 32 bytes = RP1 FIFO depth. */
 #define DMA_CHUNK_WORDS  8
 #define DMA_CHUNK_BYTES  (DMA_CHUNK_WORDS * 4)
 
@@ -277,11 +290,11 @@ static int ensure_dma_configured(rp1_jtag_t *jtag)
     if (!be->ops->config_xfer)
         return -1;
 
-    rc = be->ops->config_xfer(be, PIO_BE_DIR_TX, DMA_CHUNK_BYTES, 1);
+    rc = be->ops->config_xfer(be, PIO_BE_DIR_TX, DMA_BUF_SIZE, DMA_BUF_COUNT);
     if (rc < 0)
         return rc;
 
-    rc = be->ops->config_xfer(be, PIO_BE_DIR_RX, DMA_CHUNK_BYTES, 1);
+    rc = be->ops->config_xfer(be, PIO_BE_DIR_RX, DMA_BUF_SIZE, DMA_BUF_COUNT);
     if (rc < 0)
         return rc;
 
@@ -318,11 +331,20 @@ static int pio_shift_fast_chunk(rp1_jtag_t *jtag,
 
     /* Try threaded bidi DMA first (entire chunk in one call) */
     if (be->ops->xfer_data_bidi && ensure_dma_configured(jtag) == 0) {
+        static int bidi_chunk_num = 0;
         int data_bytes = num_words * 4;
+        bidi_chunk_num++;
         rc = be->ops->xfer_data_bidi(be, data_bytes, tdi_words,
                                           data_bytes, tdo_words);
-        if (rc < 0)
+        if (rc < 0) {
+            fprintf(stderr, "rp1_jtag: bidi DMA FAILED chunk #%d "
+                    "(%d words, %d bytes) rc=%d\n",
+                    bidi_chunk_num, num_words, data_bytes, rc);
             return RP1_JTAG_ERR_IO;
+        }
+        if (bidi_chunk_num <= 3 || bidi_chunk_num % 50 == 0)
+            fprintf(stderr, "rp1_jtag: bidi chunk #%d OK (%d bytes)\n",
+                    bidi_chunk_num, data_bytes);
     } else if (be->ops->xfer_data && ensure_dma_configured(jtag) == 0) {
         /*
          * Fallback: DMA ping-pong (TX 32 bytes, RX 32 bytes, repeat).
@@ -425,6 +447,16 @@ int pio_shift_run(rp1_jtag_t *jtag, bool tms_value,
                             INSTR_PER_BIT_FAST);
         if (rc < 0)
             return rc;
+
+        /* Configure DMA while SM is disabled — some kernel DMA drivers
+         * require the SM to be stopped during channel configuration. */
+        if (jtag->backend->ops->xfer_data_bidi ||
+            jtag->backend->ops->xfer_data) {
+            rc = ensure_dma_configured(jtag);
+            if (rc < 0)
+                fprintf(stderr, "rp1_jtag: DMA config failed, "
+                        "falling back to FIFO\n");
+        }
 
         /* Enable SM once — fast program stalls safely on autopull
          * when TX FIFO empties, holding TCK low between chunks. */
