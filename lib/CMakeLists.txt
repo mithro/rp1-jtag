@@ -46,3 +46,10 @@ install(TARGETS rp1jtag rp1jtag_static
 install(FILES include/rp1_jtag.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
+
+# Generate and install pkg-config file
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/rp1jtag.pc.in
+    ${CMAKE_CURRENT_BINARY_DIR}/rp1jtag.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/rp1jtag.pc
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+)

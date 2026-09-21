@@ -165,32 +165,30 @@ def main() -> None:
         "CMake sources",
     )
 
-    # Add USE_DEVICE_ARG support (so --pins/--device CLI args work)
-    cmake = replace_once(
-        cmake,
-        'if (ENABLE_UDEV OR ENABLE_LIBGPIOD OR ENABLE_JETSONNANOGPIO)\n'
-        '\tadd_definitions(-DUSE_DEVICE_ARG)',
-        'if (ENABLE_UDEV OR ENABLE_LIBGPIOD OR ENABLE_JETSONNANOGPIO OR ENABLE_RP1_PIO)\n'
-        '\tadd_definitions(-DUSE_DEVICE_ARG)',
-        "CMake USE_DEVICE_ARG (if)",
-    )
-    cmake = replace_once(
-        cmake,
-        'endif(ENABLE_UDEV OR ENABLE_LIBGPIOD OR ENABLE_JETSONNANOGPIO)',
-        'endif(ENABLE_UDEV OR ENABLE_LIBGPIOD OR ENABLE_JETSONNANOGPIO OR ENABLE_RP1_PIO)',
-        "CMake USE_DEVICE_ARG (endif)",
-    )
+    # (No USE_DEVICE_ARG patch: upstream made --device/-d unconditional
+    # and removed the macro, so the previous ENABLE_RP1_PIO gate is moot.)
 
     # Add link libraries after the last LIBGPIOD endif block
     # The linking section is near the end of the file (after target_link_libraries)
     link_anchor = 'endif(ENABLE_LIBGPIOD)\n'
     link_block = (
         '\nif (ENABLE_RP1_PIO)\n'
-        '\ttarget_link_libraries(openFPGALoader rp1jtag)\n'
+        '\tfind_path(RP1JTAG_INCLUDE_DIR rp1_jtag.h)\n'
+        '\tfind_library(RP1JTAG_LIBRARY rp1jtag)\n'
+        '\tif(NOT RP1JTAG_INCLUDE_DIR OR NOT RP1JTAG_LIBRARY)\n'
+        '\t\tmessage(FATAL_ERROR "librp1jtag not found (install rp1-jtag first)")\n'
+        '\tendif()\n'
+        '\tinclude_directories(${RP1JTAG_INCLUDE_DIR})\n'
+        '\ttarget_link_libraries(openFPGALoader ${RP1JTAG_LIBRARY})\n'
+        '\t# PIOLib is a transitive dependency of librp1jtag (needed for static linking)\n'
+        '\tfind_library(PIOLIB_LIBRARY pio)\n'
+        '\tif(PIOLIB_LIBRARY)\n'
+        '\t\ttarget_link_libraries(openFPGALoader ${PIOLIB_LIBRARY})\n'
+        '\tendif()\n'
         '\tadd_definitions(-DENABLE_RP1_PIO=1)\n'
         'endif(ENABLE_RP1_PIO)\n'
     )
-    if 'target_link_libraries(openFPGALoader rp1jtag)' not in cmake:
+    if 'target_link_libraries(openFPGALoader ${RP1JTAG_LIBRARY})' not in cmake:
         # Find the LAST occurrence (the linking section, not the sources section)
         idx = cmake.rfind(link_anchor)
         if idx >= 0:
