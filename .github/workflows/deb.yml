@@ -140,9 +140,23 @@ jobs:
 
               ARCH="$(dpkg --print-architecture)"
               PKG="openfpgaloader-rp1pio_${VERSION}_${ARCH}"
-              mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" \
-                       "$PKG/usr/share/doc/openfpgaloader-rp1pio"
-              cp openFPGALoader/build/openFPGALoader "$PKG/usr/bin/openFPGALoader"
+              mkdir -p "$PKG/DEBIAN" "$PKG/usr/share/doc/openfpgaloader-rp1pio"
+              # The openFPGALoader install: the binary and its data, ie the
+              # spiOverJtag bridges that --flash-info, -f and --detect -f load
+              # into Xilinx and other FPGAs. Copying only the binary made
+              # `-b arty_a7_35t --flash-info` abort with "fail to open
+              # /usr/share/openFPGALoader/spiOverJtag_xc7a35tcsg324.bit.gz",
+              # and Replaces: openfpgaloader removed the Debian package copies.
+              DESTDIR="$PWD/$PKG" cmake --install openFPGALoader/build
+              strings "$PKG/usr/bin/openFPGALoader" | grep -qx "/usr/share/openFPGALoader" \
+                || { echo "ERROR: binary does not look in /usr/share/openFPGALoader" >&2; exit 1; }
+              # The bridges of the boards this package is used on: Arty A7,
+              # NeTV2 (35T/100T), Acorn CLE-101/215.
+              for bridge in xc7a35tcsg324 xc7a35tfgg484 xc7a100tfgg484 xc7a200tsbg484; do
+                test -s "$PKG/usr/share/openFPGALoader/spiOverJtag_${bridge}.bit.gz" \
+                  || { echo "ERROR: spiOverJtag_${bridge}.bit.gz missing" >&2; exit 1; }
+              done
+              ls "$PKG/usr/share/openFPGALoader" | wc -l
               cp LICENSE "$PKG/usr/share/doc/openfpgaloader-rp1pio/copyright"
 
               # Depends from the linked shared libraries, as dh would compute.
@@ -172,7 +186,8 @@ jobs:
                 " --read-dna, --read-xadc and --read-register support absent from" \
                 " the openfpgaloader package in Debian bookworm, and --flash-info /" \
                 " --flash-info-json: SPI flash manufacturer, part, size, factory" \
-                " unique ID and SFDP read modes." \
+                " unique ID and SFDP read modes. Includes the spiOverJtag bridges" \
+                " in /usr/share/openFPGALoader." \
                 > "$PKG/DEBIAN/control"
 
               dpkg-deb --build "$PKG"
