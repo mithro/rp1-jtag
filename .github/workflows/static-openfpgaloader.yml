@@ -117,6 +117,10 @@ jobs:
               /work/openFPGALoader/build/openFPGALoader --help > help.txt
               grep -q -- "--flash-info-json" help.txt || { echo "ERROR: --flash-info missing" >&2; exit 1; }
               cp /work/openFPGALoader/build/openFPGALoader /src/openFPGALoader
+              # The data the binary loads from its DATA_DIR, /usr/local/share:
+              # the spiOverJtag bridges for -f / --flash-info.
+              DESTDIR=/work/stage cmake --install /work/openFPGALoader/build
+              cp -a /work/stage/usr/local/share/openFPGALoader /src/openfpgaloader-share
             '
 
       - name: Upload static binary
@@ -126,6 +130,7 @@ jobs:
           path: |
             openFPGALoader
             openfpgaloader-commit.txt
+            openfpgaloader-share/
           if-no-files-found: error
 
   build-static-arm32:
@@ -228,6 +233,10 @@ jobs:
               /work/openFPGALoader/build/openFPGALoader --help > help.txt
               grep -q -- "--flash-info-json" help.txt || { echo "ERROR: --flash-info missing" >&2; exit 1; }
               cp /work/openFPGALoader/build/openFPGALoader /src/openFPGALoader
+              # The data the binary loads from its DATA_DIR, /usr/local/share:
+              # the spiOverJtag bridges for -f / --flash-info.
+              DESTDIR=/work/stage cmake --install /work/openFPGALoader/build
+              cp -a /work/stage/usr/local/share/openFPGALoader /src/openfpgaloader-share
             '
 
       - name: Upload static binary
@@ -237,4 +246,5 @@ jobs:
           path: |
             openFPGALoader
             openfpgaloader-commit.txt
+            openfpgaloader-share/
           if-no-files-found: error
