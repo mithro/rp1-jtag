@@ -370,7 +370,7 @@ jobs:
     # only from main.
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: [build, build-openocd, static-site]
-    uses: mithro/apt-repo-action/.github/workflows/publish-apt.yml@main
+    uses: mithro/apt-repo-action/.github/workflows/publish-apt.yml@feat/extra-artifact
     with:
       suites: "bookworm trixie sid"
       architectures: "arm64 armhf"
