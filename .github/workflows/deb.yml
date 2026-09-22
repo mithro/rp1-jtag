@@ -309,6 +309,54 @@ jobs:
           path: built-debs/openocd-rp1pio_*.deb
           if-no-files-found: error
 
+  # Static openFPGALoader binaries (no dependency on the host's libraries),
+  # built by the reusable workflow so they are part of this run: the publish
+  # job below puts them on GitHub Pages under static/, next to the apt
+  # repository, and release-static makes a GitHub release of the same files.
+  static:
+    name: static openFPGALoader
+    uses: ./.github/workflows/static-openfpgaloader.yml
+
+  static-site:
+    name: static site
+    needs: static
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.site.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags so deb-version.py can describe
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: static-openfpgaloader-*
+          path: static-in/
+
+      # Checks every binary is a static ELF for its architecture and that all
+      # were built from the same openFPGALoader commit, then writes the
+      # per-file .sha256, SHA256SUMS and latest.json.
+      - name: Assemble static/
+        id: site
+        run: |
+          set -eux
+          VERSION="$(python3 packaging/deb-version.py)"
+          python3 packaging/static-site.py static-in static-site \
+            --version "$VERSION" --commit "$GITHUB_SHA" \
+            --openfpgaloader-repo "$OPENFPGALOADER_REPO" \
+            --openfpgaloader-ref "$OPENFPGALOADER_REF" \
+            --release-tag "openfpgaloader-static-v$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pages-url "https://mith.ro/rp1-jtag/static"
+          (cd static-site && sha256sum -c SHA256SUMS)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: static-site
+          path: static-site/
+          if-no-files-found: error
+
   publish:
     # Scoped to this job alone. A job calling a reusable workflow sets the
     # maximum permissions available to it, so the elevated Pages scopes stay
@@ -321,12 +369,61 @@ jobs:
     # repository with packages from unreviewed code. A manual run publishes
     # only from main.
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    needs: [build, build-openocd]
+    needs: [build, build-openocd, static-site]
     uses: mithro/apt-repo-action/.github/workflows/publish-apt.yml@main
     with:
       suites: "bookworm trixie sid"
       architectures: "arm64 armhf"
       keyring-name: rp1-jtag.gpg
+      extra-artifact: static-site
+      extra-dir: static
       description: "High-speed JTAG via the Raspberry Pi 5 RP1 PIO block"
     secrets:
       gpg-private-key: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+
+  # The same files as a GitHub release, so the latest static binaries have a
+  # stable URL: releases/latest/download/openFPGALoader-static-<arch>. Only
+  # after the Pages publish succeeded, so both places carry the same build.
+  release-static:
+    name: release static binaries
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [static-site, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: static-site
+          path: static-site/
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.static-site.outputs.version }}
+        run: |
+          set -eux
+          TAG="openfpgaloader-static-v$VERSION"
+          (cd static-site && sha256sum -c SHA256SUMS)
+          python3 - <<'PY' > notes.md
+          import json
+          d = json.load(open("static-site/latest.json"))
+          o = d["openfpgaloader"]
+          print("Static openFPGALoader (libgpiod, rp1pio, FTDI, ... built in) from")
+          print(f"{o['repo']} `{o['ref']}` at `{o['commit']}`,")
+          print(f"rp1-jtag {d['rp1_jtag']['version']} (`{d['rp1_jtag']['commit']}`).")
+          print()
+          print("| file | runs on (`uname -m`) | sha256 |")
+          print("|---|---|---|")
+          for f in d["files"]:
+              print(f"| `{f['name']}` | {', '.join(f['uname_m'])} | `{f['sha256']}` |")
+          print()
+          print("Also at https://mith.ro/rp1-jtag/static/ . Verify with `sha256sum -c SHA256SUMS`.")
+          PY
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null; then
+            gh release upload "$TAG" static-site/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" static-site/* --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "openFPGALoader static $VERSION" \
+              --notes-file notes.md --latest
+          fi
