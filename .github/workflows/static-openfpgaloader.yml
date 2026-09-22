@@ -1,8 +1,12 @@
 name: Static binary (openFPGALoader + rp1-jtag)
 
+# Reusable: deb.yml calls it on pull requests and on main, so the static
+# binaries are built in the same run that publishes them (GitHub Pages under
+# static/ and a GitHub release, see packaging/static-site.py). It can also be
+# run by hand.
 on:
-  push:
-  pull_request:
+  workflow_call:
+  workflow_dispatch:
 
 # openFPGALoader source: mithro/openFPGALoader flash-info adds --flash-info
 # and --flash-info-json (manufacturer, part, size, factory unique ID and
@@ -84,6 +88,7 @@ jobs:
               # Clone and patch openFPGALoader
               git clone --depth 1 --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" /work/openFPGALoader
               git -C /work/openFPGALoader log -1 --format="openFPGALoader %H %s"
+              git -C /work/openFPGALoader rev-parse HEAD > /src/openfpgaloader-commit.txt
               python3 /work/rp1-jtag/drivers/openfpgaloader/integrate.py /work/openFPGALoader
 
               # Force static linking:
@@ -118,7 +123,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: static-openfpgaloader-arm64
-          path: openFPGALoader
+          path: |
+            openFPGALoader
+            openfpgaloader-commit.txt
+          if-no-files-found: error
 
   build-static-arm32:
     name: static ${{ matrix.arch }}
@@ -190,6 +198,7 @@ jobs:
               # Clone and patch openFPGALoader
               git clone --depth 1 --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" /work/openFPGALoader
               git -C /work/openFPGALoader log -1 --format="openFPGALoader %H %s"
+              git -C /work/openFPGALoader rev-parse HEAD > /src/openfpgaloader-commit.txt
               python3 /work/rp1-jtag/drivers/openfpgaloader/integrate.py /work/openFPGALoader
 
               # Force static linking:
@@ -225,4 +234,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: static-openfpgaloader-${{ matrix.arch }}
-          path: openFPGALoader
+          path: |
+            openFPGALoader
+            openfpgaloader-commit.txt
+          if-no-files-found: error
