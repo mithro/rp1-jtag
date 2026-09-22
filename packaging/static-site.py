@@ -6,17 +6,28 @@ repository, under static/) and as the assets of a GitHub release, so a
 consumer gets identical names and checksums from either place.
 
 Input: the static-openfpgaloader-<arch> artifacts of
-.github/workflows/static-openfpgaloader.yml, each holding openFPGALoader and
-openfpgaloader-commit.txt (the openFPGALoader commit it was built from).
+.github/workflows/static-openfpgaloader.yml, each holding openFPGALoader,
+openfpgaloader-commit.txt (the openFPGALoader commit it was built from) and
+openfpgaloader-share/ (its data: the spiOverJtag bridges).
 
 Output, in OUT_DIR:
-    openFPGALoader-static-<arch>          the binary
-    openFPGALoader-static-<arch>.sha256   "<sha256>  <name>", sha256sum -c format
-    SHA256SUMS                            every binary, sha256sum -c format
+    openFPGALoader-static-<arch>          the binary alone
+    openFPGALoader-static-<arch>.tar.gz   openFPGALoader-static-<arch>/bin/openFPGALoader
+                                          and .../share/openFPGALoader/ (the bridges)
+    <each of the above>.sha256            "<sha256>  <name>", sha256sum -c format
+    SHA256SUMS                            every file above, sha256sum -c format
     latest.json                           what was built, from what, and where
 
-Every binary is checked to be a statically linked ELF for its architecture,
-and all must be built from the same openFPGALoader commit.
+Every binary is checked to be a statically linked ELF for its architecture
+that loads its data from /usr/local/share/openFPGALoader, every tarball to
+hold the bridges of the boards it is used on, and all must be built from
+the same openFPGALoader commit.
+
+The binary alone needs the bridge given with --bridge, or a directory of
+bridges in OPENFPGALOADER_SOJ_DIR, for -f / --flash-info. The tarball needs
+nothing more once extracted with `tar -xzf <tarball> --strip-components=1
+-C /usr/local` (bin/openFPGALoader, share/openFPGALoader/); extracted
+anywhere else, set OPENFPGALOADER_SOJ_DIR=<dir>/share/openFPGALoader.
 
 Usage:
     python3 packaging/static-site.py ARTIFACT_DIR OUT_DIR \\
@@ -33,6 +44,7 @@ import os
 import shutil
 import struct
 import sys
+import tarfile
 from pathlib import Path
 
 # artifact arch -> (ELF e_machine, ELF class, `uname -m` values it runs on)
@@ -42,6 +54,10 @@ ARCHES = {
     "armv6": (40, 1, ["armv6l", "armv7l", "aarch64"]),
 }
 PT_INTERP = 3
+DATA_DIR = b"/usr/local/share/openFPGALoader"
+# bridges of the boards these binaries are used on: Arty A7, NeTV2 35T/100T,
+# Acorn CLE-101/215
+BRIDGES = ["xc7a35tcsg324", "xc7a35tfgg484", "xc7a100tfgg484", "xc7a200tsbg484"]
 
 
 def elf_check(path: Path, machine: int, elf_class: int) -> None:
@@ -92,30 +108,49 @@ def main() -> None:
         if not binary.is_file() or not commit_file.is_file():
             sys.exit(f"ERROR: {src}: missing openFPGALoader or openfpgaloader-commit.txt")
         elf_check(binary, machine, elf_class)
+        if DATA_DIR + b"\0" not in binary.read_bytes():
+            sys.exit(f"ERROR: {binary}: does not load its data from {DATA_DIR.decode()}")
+        share = src / "openfpgaloader-share"
+        for bridge in BRIDGES:
+            if not (share / f"spiOverJtag_{bridge}.bit.gz").is_file():
+                sys.exit(f"ERROR: {share}: spiOverJtag_{bridge}.bit.gz missing")
         ofl_commits.add(commit_file.read_text().strip())
 
         name = f"openFPGALoader-static-{arch}"
         dst = args.out_dir / name
         shutil.copyfile(binary, dst)
         os.chmod(dst, 0o755)
-        digest = hashlib.sha256(dst.read_bytes()).hexdigest()
-        line = f"{digest}  {name}\n"
-        (args.out_dir / f"{name}.sha256").write_text(line)
-        sums.append(line)
-        files.append({
-            "arch": arch,
-            "uname_m": uname,
-            "name": name,
-            "sha256": digest,
-            "size": dst.stat().st_size,
-            "url": {
-                "release": f"https://github.com/{args.repo}/releases/download/"
-                           f"{args.release_tag}/{name}",
-                "release_latest": f"https://github.com/{args.repo}/releases/latest/"
-                                  f"download/{name}",
-                "pages": f"{args.pages_url}/{name}",
-            },
-        })
+
+        tgz = args.out_dir / f"{name}.tar.gz"
+        with tarfile.open(tgz, "w:gz") as t:
+            def norm(ti: tarfile.TarInfo) -> tarfile.TarInfo:
+                ti.uid = ti.gid = 0
+                ti.uname = ti.gname = "root"
+                ti.mode = 0o755 if ti.isdir() or ti.name.endswith("/bin/openFPGALoader") else 0o644
+                return ti
+            t.add(dst, arcname=f"{name}/bin/openFPGALoader", filter=norm)
+            t.add(share, arcname=f"{name}/share/openFPGALoader", filter=norm)
+
+        for kind, path in (("binary", dst), ("tarball", tgz)):
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            line = f"{digest}  {path.name}\n"
+            (args.out_dir / f"{path.name}.sha256").write_text(line)
+            sums.append(line)
+            files.append({
+                "arch": arch,
+                "kind": kind,
+                "uname_m": uname,
+                "name": path.name,
+                "sha256": digest,
+                "size": path.stat().st_size,
+                "url": {
+                    "release": f"https://github.com/{args.repo}/releases/download/"
+                               f"{args.release_tag}/{path.name}",
+                    "release_latest": f"https://github.com/{args.repo}/releases/latest/"
+                                      f"download/{path.name}",
+                    "pages": f"{args.pages_url}/{path.name}",
+                },
+            })
 
     if len(ofl_commits) != 1:
         sys.exit(f"ERROR: binaries built from different openFPGALoader commits: "
@@ -133,6 +168,7 @@ def main() -> None:
             "commit": ofl_commit,
         },
         "release_tag": args.release_tag,
+        "data_dir": DATA_DIR.decode(),
         "files": files,
     }
     (args.out_dir / "latest.json").write_text(json.dumps(latest, indent=2) + "\n")
