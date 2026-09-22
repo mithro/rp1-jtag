@@ -25,6 +25,15 @@ on:
 permissions:
   contents: read
 
+# openFPGALoader source: mithro/openFPGALoader flash-info adds --flash-info
+# and --flash-info-json (manufacturer, part, size, factory unique ID and
+# SFDP read modes of the SPI flash) on top of upstream trabucayre master.
+# Every openFPGALoader build below clones this and fails if the option is
+# missing, so a source change cannot silently drop it.
+env:
+  OPENFPGALOADER_REPO: https://github.com/mithro/openFPGALoader.git
+  OPENFPGALOADER_REF: flash-info
+
 jobs:
   build:
     name: deb (${{ matrix.suite }} ${{ matrix.arch }})
@@ -53,6 +62,7 @@ jobs:
           set -eux
           mkdir -p built-debs
           docker run --rm --platform "$PLATFORM" \
+            -e OPENFPGALOADER_REPO -e OPENFPGALOADER_REF \
             -v "$GITHUB_WORKSPACE:/work/src" \
             -v "$GITHUB_WORKSPACE/built-debs:/work/out" \
             -w /work/src \
@@ -101,7 +111,8 @@ jobs:
               fi
 
               # 2. openFPGALoader with the rp1pio cable driver.
-              git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git
+              git clone --depth 1 --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" openFPGALoader
+              git -C openFPGALoader log -1 --format="openFPGALoader %H %s"
               python3 drivers/openfpgaloader/integrate.py openFPGALoader
               # Every cable and vendor openFPGALoader can build on Linux.
               # ENABLE_CABLE_ALL/ENABLE_VENDORS_ALL are the upstream defaults
@@ -123,6 +134,9 @@ jobs:
               openFPGALoader/build/openFPGALoader --list-cables | tee cables.txt
               grep -qw libgpiod cables.txt || { echo "ERROR: libgpiod cable missing" >&2; exit 1; }
               grep -qw rp1pio cables.txt || { echo "ERROR: rp1pio cable missing" >&2; exit 1; }
+              # --flash-info comes from OPENFPGALOADER_REF: fail if it is missing.
+              openFPGALoader/build/openFPGALoader --help > help.txt
+              grep -q -- "--flash-info-json" help.txt || { echo "ERROR: --flash-info missing" >&2; exit 1; }
 
               ARCH="$(dpkg --print-architecture)"
               PKG="openfpgaloader-rp1pio_${VERSION}_${ARCH}"
@@ -156,7 +170,9 @@ jobs:
                 " openFPGALoader built with the rp1pio cable driver for high-speed" \
                 " JTAG via the Raspberry Pi 5 RP1 PIO block. Also carries the" \
                 " --read-dna, --read-xadc and --read-register support absent from" \
-                " the openfpgaloader package in Debian bookworm." \
+                " the openfpgaloader package in Debian bookworm, and --flash-info /" \
+                " --flash-info-json: SPI flash manufacturer, part, size, factory" \
+                " unique ID and SFDP read modes." \
                 > "$PKG/DEBIAN/control"
 
               dpkg-deb --build "$PKG"

@@ -4,6 +4,15 @@ on:
   push:
   pull_request:
 
+# openFPGALoader source: mithro/openFPGALoader flash-info adds --flash-info
+# and --flash-info-json (manufacturer, part, size, factory unique ID and
+# SFDP read modes of the SPI flash) on top of upstream trabucayre master.
+# Every openFPGALoader build below clones this and fails if the option is
+# missing, so a source change cannot silently drop it.
+env:
+  OPENFPGALOADER_REPO: https://github.com/mithro/openFPGALoader.git
+  OPENFPGALOADER_REF: flash-info
+
 jobs:
   build-static:
     name: static arm64
@@ -19,6 +28,7 @@ jobs:
       - name: Build static openFPGALoader in Alpine container
         run: |
           docker run --rm \
+            -e OPENFPGALOADER_REPO -e OPENFPGALOADER_REF \
             -v "$GITHUB_WORKSPACE:/src" \
             -w /work \
             alpine:latest sh -c '
@@ -72,7 +82,8 @@ jobs:
               cmake --install /work/rp1-jtag/build
 
               # Clone and patch openFPGALoader
-              git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git /work/openFPGALoader
+              git clone --depth 1 --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" /work/openFPGALoader
+              git -C /work/openFPGALoader log -1 --format="openFPGALoader %H %s"
               python3 /work/rp1-jtag/drivers/openfpgaloader/integrate.py /work/openFPGALoader
 
               # Force static linking:
@@ -97,6 +108,9 @@ jobs:
               # Verify and copy out
               file /work/openFPGALoader/build/openFPGALoader
               file /work/openFPGALoader/build/openFPGALoader | grep -qE "statically linked|static-pie linked"
+              # --flash-info comes from OPENFPGALOADER_REF: fail if it is missing.
+              /work/openFPGALoader/build/openFPGALoader --help > help.txt
+              grep -q -- "--flash-info-json" help.txt || { echo "ERROR: --flash-info missing" >&2; exit 1; }
               cp /work/openFPGALoader/build/openFPGALoader /src/openFPGALoader
             '
 
@@ -132,6 +146,7 @@ jobs:
         run: |
           docker run --rm \
             --platform ${{ matrix.platform }} \
+            -e OPENFPGALOADER_REPO -e OPENFPGALOADER_REF \
             -v "$GITHUB_WORKSPACE:/src" \
             -w /work \
             ${{ matrix.docker_image }} sh -c '
@@ -173,7 +188,8 @@ jobs:
               cmake --install /work/rp1-jtag/build
 
               # Clone and patch openFPGALoader
-              git clone --depth 1 https://github.com/trabucayre/openFPGALoader.git /work/openFPGALoader
+              git clone --depth 1 --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" /work/openFPGALoader
+              git -C /work/openFPGALoader log -1 --format="openFPGALoader %H %s"
               python3 /work/rp1-jtag/drivers/openfpgaloader/integrate.py /work/openFPGALoader
 
               # Force static linking:
@@ -199,6 +215,9 @@ jobs:
               # Verify and copy out
               file /work/openFPGALoader/build/openFPGALoader
               file /work/openFPGALoader/build/openFPGALoader | grep -qE "statically linked|static-pie linked"
+              # --flash-info comes from OPENFPGALOADER_REF: fail if it is missing.
+              /work/openFPGALoader/build/openFPGALoader --help > help.txt
+              grep -q -- "--flash-info-json" help.txt || { echo "ERROR: --flash-info missing" >&2; exit 1; }
               cp /work/openFPGALoader/build/openFPGALoader /src/openFPGALoader
             '
 
