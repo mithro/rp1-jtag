@@ -113,6 +113,12 @@ jobs:
               # 2. openFPGALoader with the rp1pio cable driver.
               git clone --depth 1 --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" openFPGALoader
               git -C openFPGALoader log -1 --format="openFPGALoader %H %s"
+              # OPENFPGALOADER_REF is a branch, so it can move while this
+              # repository does not. Put its commit in the version (issue #18):
+              # otherwise a rebuild republishes new binaries as the version
+              # hosts already have, and apt never upgrades them.
+              OFL_VERSION="$(python3 packaging/deb-version.py --source ofl=openFPGALoader)"
+              echo "openfpgaloader-rp1pio version $OFL_VERSION"
               python3 drivers/openfpgaloader/integrate.py openFPGALoader
               # Every cable and vendor openFPGALoader can build on Linux.
               # ENABLE_CABLE_ALL/ENABLE_VENDORS_ALL are the upstream defaults
@@ -139,7 +145,7 @@ jobs:
               grep -q -- "--flash-info-json" help.txt || { echo "ERROR: --flash-info missing" >&2; exit 1; }
 
               ARCH="$(dpkg --print-architecture)"
-              PKG="openfpgaloader-rp1pio_${VERSION}_${ARCH}"
+              PKG="openfpgaloader-rp1pio_${OFL_VERSION}_${ARCH}"
               mkdir -p "$PKG/DEBIAN" "$PKG/usr/share/doc/openfpgaloader-rp1pio"
               # The openFPGALoader install: the binary and its data, ie the
               # spiOverJtag bridges that --flash-info, -f and --detect -f load
@@ -170,7 +176,7 @@ jobs:
               # it, which forces consumers to remove it by hand first.
               printf "%s\n" \
                 "Package: openfpgaloader-rp1pio" \
-                "Version: ${VERSION}" \
+                "Version: ${OFL_VERSION}" \
                 "Architecture: ${ARCH}" \
                 "Maintainer: Tim Ansell <me@mith.ro>" \
                 "Depends: ${DEPENDS}" \
