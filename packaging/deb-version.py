@@ -10,9 +10,19 @@ new, upgradeable package with no manual bump and no tag. All forms are valid
 Debian versions verbatim, and match the scheme used by the other mithro apt
 repositories (see mithro/apt-repo-action).
 
+Packages that also bundle a third-party tree cloned at build time (the
+openFPGALoader flash-info branch, OpenOCD master) pass ``--source TAG=DIR``.
+That appends ``+<TAG><committer date, UTC, YYYYMMDDHHMMSS>.<sha7>`` of DIR's
+HEAD, e.g. ``0.0.post85+ofl20260922130212.5d0ae2e``. A newer source commit
+then yields a newer version even when this repository has not moved, so a
+rebuild is upgradeable instead of reusing a version apt already has installed.
+dpkg sorts ``+...`` above the bare version, and compares the digit run as a
+number, so the suffix increases with the source commit's date.
+
 Usage:
     python3 packaging/deb-version.py                    # print the version
     python3 packaging/deb-version.py --write-changelog  # stamp debian/changelog
+    python3 packaging/deb-version.py --source ofl=openFPGALoader
 """
 
 from __future__ import annotations
@@ -32,12 +42,13 @@ SOURCE = "rp1-jtag"
 MAINTAINER = "Tim 'mithro' Ansell <me@mith.ro>"
 
 DESCRIBE_RE = re.compile(r"^v(\d+\.\d+)-(\d+)-g[0-9a-f]+$")
+SOURCE_TAG_RE = re.compile(r"^[a-z]+$")
 
 
-def _git(*args: str) -> str:
+def _git(*args: str, repo: Path = REPO, env: dict[str, str] | None = None) -> str:
     return subprocess.run(
-        ["git", "-C", str(REPO), *args],
-        capture_output=True, text=True, check=True,
+        ["git", "-C", str(repo), *args],
+        capture_output=True, text=True, check=True, env=env,
     ).stdout.strip()
 
 
@@ -63,6 +74,34 @@ def version() -> str:
     return series if distance == 0 else f"{series}.post{distance}"
 
 
+def source_suffix(spec: str) -> str:
+    """``+<tag><YYYYMMDDHHMMSS>.<sha7>`` for the HEAD of a ``TAG=DIR`` checkout.
+
+    The committer date, not a commit count, so it works on the ``--depth 1``
+    clones the workflows make; rebasing or amending the branch gives a new
+    committer date, so the suffix still increases.
+    """
+    tag, sep, directory = spec.partition("=")
+    if not sep or not SOURCE_TAG_RE.match(tag) or not directory:
+        print(f"ERROR: --source wants TAG=DIR with a lowercase TAG, got {spec!r}",
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        stamp, sha = _git(
+            "-c", "log.showSignature=false",
+            "log", "-1", "--format=%cd %h", "--abbrev=7",
+            "--date=format-local:%Y%m%d%H%M%S",
+            repo=Path(directory),
+            # format-local renders in $TZ; pin it so every builder agrees.
+            env={**os.environ, "TZ": "UTC"},
+        ).split()
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: cannot read HEAD of {directory}: {e.stderr.strip()}",
+              file=sys.stderr)
+        sys.exit(1)
+    return f"+{tag}{stamp}.{sha}"
+
+
 def write_changelog(ver: str) -> None:
     """Rewrite debian/changelog with this version.
 
@@ -86,9 +125,17 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--write-changelog", action="store_true",
                     help="stamp debian/changelog with the derived version")
+    ap.add_argument("--source", metavar="TAG=DIR",
+                    help="append the HEAD commit of the git checkout DIR "
+                         "(a bundled third-party source) as +TAG<date>.<sha7>")
     args = ap.parse_args()
+    if args.source and args.write_changelog:
+        # debian/changelog versions librp1jtag, which bundles no such source.
+        ap.error("--source and --write-changelog are mutually exclusive")
 
     ver = version()
+    if args.source:
+        ver += source_suffix(args.source)
     if args.write_changelog:
         write_changelog(ver)
         print(f"wrote {CHANGELOG} ({ver})", file=sys.stderr)
