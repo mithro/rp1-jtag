@@ -5,14 +5,19 @@ on:
   workflow_dispatch:
   pull_request:
 
-# openFPGALoader source: mithro/openFPGALoader flash-info adds --flash-info
-# and --flash-info-json (manufacturer, part, size, factory unique ID and
-# SFDP read modes of the SPI flash) on top of upstream trabucayre master.
-# Every openFPGALoader build below clones this and fails if the option is
-# missing, so a source change cannot silently drop it.
+# Static binaries as workflow artifacts, for development and hardware testing
+# on hosts too old for the packages (a Pi running stretch, say). The static
+# binaries fpgas.online ships come from fpgas-online/fpgas.online-fpga-tools,
+# which publishes them as release assets with the spiOverJtag data beside
+# them; these carry the binary alone.
+#
+# Built from UNPATCHED upstream openFPGALoader with the rp1pio driver
+# injected by drivers/openfpgaloader/integrate.py: this repository develops
+# that driver, and the flash-info, NeTV2 and Tiny Tapeout patches belong to
+# the fpgas.online series, not here.
 env:
-  OPENFPGALOADER_REPO: https://github.com/mithro/openFPGALoader.git
-  OPENFPGALOADER_REF: flash-info
+  OPENFPGALOADER_REPO: https://github.com/trabucayre/openFPGALoader.git
+  OPENFPGALOADER_REF: master
 
 jobs:
   build-static:
@@ -67,7 +72,7 @@ jobs:
               # sibling pinctrl/ tree, which is not built when piolib is
               # configured standalone, so a full build fails at link time.
               # NOTE: no apostrophes in this script, it is single-quoted.
-              git clone --depth 1 https://github.com/raspberrypi/utils.git /work/rpi-utils
+              git clone https://github.com/raspberrypi/utils.git /work/rpi-utils
               cmake -B /work/rpi-utils/piolib/build /work/rpi-utils/piolib \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX=/usr \
@@ -83,7 +88,7 @@ jobs:
               cmake --install /work/rp1-jtag/build
 
               # Clone and patch openFPGALoader
-              git clone --depth 1 --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" /work/openFPGALoader
+              git clone --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" /work/openFPGALoader
               git -C /work/openFPGALoader log -1 --format="openFPGALoader %H %s"
               python3 /work/rp1-jtag/drivers/openfpgaloader/integrate.py /work/openFPGALoader
 
@@ -109,9 +114,9 @@ jobs:
               # Verify and copy out
               file /work/openFPGALoader/build/openFPGALoader
               file /work/openFPGALoader/build/openFPGALoader | grep -qE "statically linked|static-pie linked"
-              # --flash-info comes from OPENFPGALOADER_REF: fail if it is missing.
-              /work/openFPGALoader/build/openFPGALoader --help > help.txt
-              grep -q -- "--flash-info-json" help.txt || { echo "ERROR: --flash-info missing" >&2; exit 1; }
+              # The driver this repository develops must be in the binary.
+              /work/openFPGALoader/build/openFPGALoader --list-cables > cables.txt
+              grep -qw rp1pio cables.txt || { echo "ERROR: rp1pio cable missing" >&2; exit 1; }
               cp /work/openFPGALoader/build/openFPGALoader /src/openFPGALoader
             '
 
@@ -189,7 +194,7 @@ jobs:
               cmake --install /work/rp1-jtag/build
 
               # Clone and patch openFPGALoader
-              git clone --depth 1 --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" /work/openFPGALoader
+              git clone --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" /work/openFPGALoader
               git -C /work/openFPGALoader log -1 --format="openFPGALoader %H %s"
               python3 /work/rp1-jtag/drivers/openfpgaloader/integrate.py /work/openFPGALoader
 
@@ -216,9 +221,9 @@ jobs:
               # Verify and copy out
               file /work/openFPGALoader/build/openFPGALoader
               file /work/openFPGALoader/build/openFPGALoader | grep -qE "statically linked|static-pie linked"
-              # --flash-info comes from OPENFPGALOADER_REF: fail if it is missing.
-              /work/openFPGALoader/build/openFPGALoader --help > help.txt
-              grep -q -- "--flash-info-json" help.txt || { echo "ERROR: --flash-info missing" >&2; exit 1; }
+              # The driver this repository develops must be in the binary.
+              /work/openFPGALoader/build/openFPGALoader --list-cables > cables.txt
+              grep -qw rp1pio cables.txt || { echo "ERROR: rp1pio cable missing" >&2; exit 1; }
               cp /work/openFPGALoader/build/openFPGALoader /src/openFPGALoader
             '
 

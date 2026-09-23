@@ -4,20 +4,42 @@ High-speed JTAG via Raspberry Pi 5 RP1 PIO.
 
 The RPi 5's GPIO pins connect to the RP1 chip via PCIe, making traditional software bit-banging (sysfsgpio, linuxgpiod) ~50-200x slower than the direct-register approach that worked on Pi 1-4. The RP1 contains a PIO (Programmable I/O) subsystem that can run autonomous state machines at up to 200 MHz, bypassing the PCIe latency bottleneck entirely.
 
+## This is the development repository
+
+It holds the library and the two drivers, and its CI uploads binaries as
+workflow artifacts for development and hardware testing. **It publishes no
+Debian packages and no binary releases.**
+
+Installable packages and static binaries come from
+[fpgas-online/fpgas.online-fpga-tools](https://github.com/fpgas-online/fpgas.online-fpga-tools),
+which carries these drivers inside a larger patch series (SPI flash info,
+NeTV2 boards, Tiny Tapeout FPGA Demo Board, ECP5 TraceID) and builds
+`openfpgaloader-fpgasonline` / `openocd-fpgasonline` for bookworm, trixie and
+sid on arm64 and armhf, plus static arm64/armv7/armv6 binaries.
+
+The packages this repository used to publish — `openfpgaloader-rp1pio` and
+`openocd-rp1pio` from `mith.ro/rp1-jtag` — are superseded by those.
+
 ## Components
 
 - **librp1jtag** — C library wrapping PIOLib for high-speed JTAG shift operations
 - **openFPGALoader driver** — Native `rp1pio` cable driver
-- **OpenOCD driver** — Native `rp1_pio` adapter driver
-- **XVC daemon** — Standalone Xilinx Virtual Cable server
+- **OpenOCD driver** — Native `rp1_pio_jtag` adapter driver
 
 ## Performance
 
-| Method | Throughput | 3.6 MB bitstream |
+Measured 2026-09-22 on a Pi 5 (rpi5-netv2) loading a 3.8 MB XC7A100T
+bitstream to `DONE=1`, stock kernel 6.12.47:
+
+| Method | Throughput | 3.8 MB bitstream |
 |--------|-----------|-----------------|
-| sysfsgpio | ~5 kB/s | ~10 minutes |
-| librp1jtag (word-by-word) | ~400 kB/s | ~9 seconds |
-| librp1jtag (DMA) | ~750 kB/s+ | ~5 seconds |
+| libgpiod bit-bang (Pi 5) | ~51 kB/s | ~75 s |
+| librp1jtag as shipped (word-by-word FIFO) | ~97 kB/s | ~39 s |
+| librp1jtag streaming DMA (work in progress) | ~640 kB/s | ~5.9 s |
+
+The streaming DMA path is not on `main`; the shipped library has
+`use_dma = false`. Kernel 6.18.50 additionally fails the Raspberry Pi PIO DMA
+reference test, so the DMA numbers above hold only on 6.12.47.
 
 ## Quick Start
 
@@ -111,7 +133,7 @@ All pin numbers are configurable at runtime.
 ## Architecture
 
 ```
-openFPGALoader / OpenOCD / XVC daemon
+     openFPGALoader / OpenOCD
             |
       librp1jtag (C library)
             |
