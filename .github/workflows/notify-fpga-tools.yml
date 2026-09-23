@@ -1,0 +1,41 @@
+name: Notify fpgas.online-fpga-tools
+
+# fpgas-online/fpgas.online-fpga-tools builds the packages and static binaries
+# that carry this repository's drivers. Tell it when main moves so it can
+# rebuild and republish, rather than waiting for its weekly bump.
+#
+# The payload carries the commit so the rebuild can record what triggered it.
+#
+# Requires the repository secret FPGA_TOOLS_DISPATCH_TOKEN: a token with
+# `contents: write` on fpgas-online/fpgas.online-fpga-tools (a fine-grained
+# token scoped to that one repository is enough). Until the secret exists this
+# job warns and passes, so the absence of a credential never fails a push.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: repository_dispatch rp1jtag-updated
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tell the distribution repository to rebuild
+        env:
+          GH_TOKEN: ${{ secrets.FPGA_TOOLS_DISPATCH_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::FPGA_TOOLS_DISPATCH_TOKEN is not set; not notifying fpgas.online-fpga-tools"
+            exit 0
+          fi
+          gh api repos/fpgas-online/fpgas.online-fpga-tools/dispatches \
+            -f event_type=rp1jtag-updated \
+            -f "client_payload[sha]=$SHA" \
+            -f "client_payload[repository]=$GITHUB_REPOSITORY"
+          echo "notified fpgas.online-fpga-tools of $SHA"
