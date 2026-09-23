@@ -1,0 +1,194 @@
+name: Tool builds
+
+# Integration coverage for the two drivers this repository develops: build
+# openFPGALoader and OpenOCD from their UNPATCHED upstreams with the drivers
+# injected by drivers/*/integrate.py, and upload the binaries as workflow
+# artifacts.
+#
+# Artifacts only. Debian packages and static release binaries for
+# fpgas.online are built and published by
+# https://github.com/fpgas-online/fpgas.online-fpga-tools, which carries this
+# repository's drivers as part of a larger patch series (flash-info, NeTV2,
+# Tiny Tapeout, ECP5 TraceID). A binary from here is for development and
+# hardware testing, not for installing on a fleet host.
+#
+# Upstream, not a fork: integrate.py has to keep applying to what upstream
+# actually ships, so a build that needed a patched tool would hide exactly the
+# breakage this workflow exists to catch.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OPENFPGALOADER_REPO: https://github.com/trabucayre/openFPGALoader.git
+  OPENFPGALOADER_REF: master
+  OPENOCD_REPO: https://github.com/openocd-org/openocd.git
+  OPENOCD_REF: master
+
+jobs:
+  openfpgaloader:
+    name: openFPGALoader (${{ matrix.arch }})
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            platform: linux/arm64
+          - arch: armhf
+            platform: linux/arm/v7
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build openFPGALoader with the rp1pio cable driver
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -eux
+          mkdir -p out
+          docker run --rm --platform "$PLATFORM" \
+            -e OPENFPGALOADER_REPO -e OPENFPGALOADER_REF \
+            -v "$GITHUB_WORKSPACE:/work/src" \
+            -v "$GITHUB_WORKSPACE/out:/work/out" \
+            -w /work/src \
+            debian:trixie bash -ec '
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential cmake git pkg-config python3 ca-certificates \
+                libftdi1-dev libusb-1.0-0-dev zlib1g-dev libhidapi-dev \
+                libudev-dev libgpiod-dev
+
+              git config --global --add safe.directory /work/src
+
+              # PIOLib (raspberrypi/utils) is the /dev/pio0 backend of librp1jtag.
+              # Debian does not package it, so build it here; without it CMake
+              # reports "PIOLib not found" and builds a stub backend, and the
+              # cable then fails with "compiled without PIOLib support".
+              # Only the library target: the piolib examples link gpiolib from
+              # the sibling pinctrl/ tree, absent in a standalone configure.
+              git clone https://github.com/raspberrypi/utils.git /work/rpi-utils
+              cmake -B /work/rpi-utils/piolib/build -S /work/rpi-utils/piolib \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr \
+                -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+              cmake --build /work/rpi-utils/piolib/build --parallel --target pio
+              cmake --install /work/rpi-utils/piolib/build --component piolib
+
+              cmake -B /work/rp1jtag-build -S /work/src \
+                -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+              cmake --build /work/rp1jtag-build --parallel
+              cmake --install /work/rp1jtag-build
+              ldconfig
+              if strings /usr/lib/*/librp1jtag.so.0 | grep -q "compiled without PIOLib support"; then
+                echo "ERROR: librp1jtag was built without PIOLib" >&2
+                exit 1
+              fi
+
+              git clone --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" /work/openFPGALoader
+              git -C /work/openFPGALoader log -1 --format="openFPGALoader %H %s" | tee /work/out/openFPGALoader.source
+              python3 drivers/openfpgaloader/integrate.py /work/openFPGALoader
+
+              # Every cable and vendor openFPGALoader builds on Linux.
+              # ENABLE_CABLE_ALL/ENABLE_VENDORS_ALL are upstream defaults,
+              # pinned so a future default change is visible here. libgpiod is
+              # the backend upstream silently disables when its headers are
+              # missing, so it is asserted below: it is what the Pi 1-4 hosts
+              # without an RP1 use.
+              cmake -B /work/openFPGALoader/build -S /work/openFPGALoader \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DENABLE_CABLE_ALL=ON \
+                -DENABLE_VENDORS_ALL=ON \
+                -DENABLE_LIBGPIOD=ON \
+                -DENABLE_UDEV=ON \
+                -DENABLE_USB_SCAN=ON \
+                -DENABLE_RP1_PIO=ON \
+                -DCMAKE_INSTALL_PREFIX=/usr
+              cmake --build /work/openFPGALoader/build --parallel
+              /work/openFPGALoader/build/openFPGALoader --list-cables | tee /work/out/cables.txt
+              grep -qw rp1pio /work/out/cables.txt || { echo "ERROR: rp1pio cable missing" >&2; exit 1; }
+              grep -qw libgpiod /work/out/cables.txt || { echo "ERROR: libgpiod cable missing" >&2; exit 1; }
+              cp /work/openFPGALoader/build/openFPGALoader /work/out/
+            '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openfpgaloader-rp1pio-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+
+  openocd:
+    name: OpenOCD (${{ matrix.arch }})
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            platform: linux/arm64
+          - arch: armhf
+            platform: linux/arm/v7
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build OpenOCD with the rp1_pio_jtag adapter driver
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -eux
+          mkdir -p out
+          docker run --rm --platform "$PLATFORM" \
+            -e OPENOCD_REPO -e OPENOCD_REF \
+            -v "$GITHUB_WORKSPACE:/work/src" \
+            -v "$GITHUB_WORKSPACE/out:/work/out" \
+            -w /work/src \
+            debian:trixie bash -ec '
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential cmake git pkg-config python3 ca-certificates \
+                autoconf automake libtool texinfo \
+                libusb-1.0-0-dev libftdi1-dev libhidapi-dev libjim-dev \
+                libgpiod-dev libcapstone-dev
+
+              git config --global --add safe.directory /work/src
+
+              git clone https://github.com/raspberrypi/utils.git /work/rpi-utils
+              cmake -B /work/rpi-utils/piolib/build -S /work/rpi-utils/piolib \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr \
+                -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+              cmake --build /work/rpi-utils/piolib/build --parallel --target pio
+              cmake --install /work/rpi-utils/piolib/build --component piolib
+
+              cmake -B /work/rp1jtag-build -S /work/src \
+                -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+              cmake --build /work/rp1jtag-build --parallel
+              cmake --install /work/rp1jtag-build
+              ldconfig
+
+              git clone --branch "$OPENOCD_REF" "$OPENOCD_REPO" /work/openocd
+              git -C /work/openocd log -1 --format="openocd %H %s" | tee /work/out/openocd.source
+              python3 drivers/openocd/integrate.py /work/openocd
+              cd /work/openocd
+              ./bootstrap nosubmodule
+              ./configure --prefix=/usr --enable-rp1-pio-jtag --disable-werror
+              make -j"$(nproc)"
+
+              # The driver is registered in the adapter table, not just linked.
+              ./src/openocd -c "adapter list" -c shutdown > /work/out/adapters.txt
+              grep -qw rp1_pio_jtag /work/out/adapters.txt \
+                || { echo "ERROR: rp1_pio_jtag adapter missing" >&2; exit 1; }
+              cp ./src/openocd /work/out/
+            '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openocd-rp1pio-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
