@@ -12,12 +12,12 @@ repositories (see mithro/apt-repo-action).
 
 Packages that also bundle a third-party tree cloned at build time (the
 openFPGALoader flash-info branch, OpenOCD master) pass ``--source TAG=DIR``.
-That appends ``+<TAG><committer date, UTC, YYYYMMDDHHMMSS>.<sha7>`` of DIR's
-HEAD, e.g. ``0.0.post85+ofl20260922130212.5d0ae2e``. A newer source commit
-then yields a newer version even when this repository has not moved, so a
-rebuild is upgradeable instead of reusing a version apt already has installed.
-dpkg sorts ``+...`` above the bare version, and compares the digit run as a
-number, so the suffix increases with the source commit's date.
+That appends ``+<TAG><commits in DIR>.<sha7>`` of DIR's HEAD, e.g.
+``0.0.post85+ofl2314.5d0ae2e``. A newer source commit then yields a newer
+version even when this repository has not moved, so a rebuild is upgradeable
+instead of reusing a version apt already has installed. dpkg sorts ``+...``
+above the bare version and compares the digit run as a number, so the suffix
+increases with the source's commit count, as ``.postN`` does for this repo.
 
 Usage:
     python3 packaging/deb-version.py                    # print the version
@@ -45,10 +45,10 @@ DESCRIBE_RE = re.compile(r"^v(\d+\.\d+)-(\d+)-g[0-9a-f]+$")
 SOURCE_TAG_RE = re.compile(r"^[a-z]+$")
 
 
-def _git(*args: str, repo: Path = REPO, env: dict[str, str] | None = None) -> str:
+def _git(*args: str, repo: Path = REPO) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), *args],
-        capture_output=True, text=True, check=True, env=env,
+        capture_output=True, text=True, check=True,
     ).stdout.strip()
 
 
@@ -75,11 +75,12 @@ def version() -> str:
 
 
 def source_suffix(spec: str) -> str:
-    """``+<tag><YYYYMMDDHHMMSS>.<sha7>`` for the HEAD of a ``TAG=DIR`` checkout.
+    """``+<tag><count>.<sha7>`` for the HEAD of a ``TAG=DIR`` checkout.
 
-    The committer date, not a commit count, so it works on the ``--depth 1``
-    clones the workflows make; rebasing or amending the branch gives a new
-    committer date, so the suffix still increases.
+    The commit count is what orders the suffix, exactly as ``.postN`` orders
+    the base version; the sha only names the build. The workflows therefore
+    clone these trees with their full history -- a ``--depth 1`` clone counts
+    1 for every commit, which would never increase.
     """
     tag, sep, directory = spec.partition("=")
     if not sep or not SOURCE_TAG_RE.match(tag) or not directory:
@@ -87,19 +88,22 @@ def source_suffix(spec: str) -> str:
               file=sys.stderr)
         sys.exit(1)
     try:
-        stamp, sha = _git(
-            "-c", "log.showSignature=false",
-            "log", "-1", "--format=%cd %h", "--abbrev=7",
-            "--date=format-local:%Y%m%d%H%M%S",
-            repo=Path(directory),
-            # format-local renders in $TZ; pin it so every builder agrees.
-            env={**os.environ, "TZ": "UTC"},
-        ).split()
+        count = _git("rev-list", "--count", "HEAD", repo=Path(directory))
+        sha = _git("rev-parse", "--short=7", "HEAD", repo=Path(directory))
+        shallow = _git("rev-parse", "--is-shallow-repository", repo=Path(directory))
     except subprocess.CalledProcessError as e:
         print(f"ERROR: cannot read HEAD of {directory}: {e.stderr.strip()}",
               file=sys.stderr)
         sys.exit(1)
-    return f"+{tag}{stamp}.{sha}"
+    if shallow == "true":
+        # Counting commits in a shallow clone silently yields a number that
+        # does not grow with the branch, so every rebuild would publish the
+        # same version again -- the very bug this suffix exists to fix.
+        print(f"ERROR: {directory} is a shallow clone; "
+              f"clone it with full history so commits can be counted",
+              file=sys.stderr)
+        sys.exit(1)
+    return f"+{tag}{count}.{sha}"
 
 
 def write_changelog(ver: str) -> None:
