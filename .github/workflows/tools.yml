@@ -181,7 +181,8 @@ jobs:
               make -j"$(nproc)"
 
               # The driver is registered in the adapter table, not just linked.
-              ./src/openocd -c "adapter list" -c shutdown > /work/out/adapters.txt
+              # OpenOCD writes its log, the adapter list included, to stderr.
+              ./src/openocd -c "adapter list" -c shutdown > /work/out/adapters.txt 2>&1
               grep -qw rp1_pio_jtag /work/out/adapters.txt \
                 || { echo "ERROR: rp1_pio_jtag adapter missing" >&2; exit 1; }
               cp ./src/openocd /work/out/
