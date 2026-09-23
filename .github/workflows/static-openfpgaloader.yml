@@ -66,7 +66,7 @@ jobs:
               # sibling pinctrl/ tree, which is not built when piolib is
               # configured standalone, so a full build fails at link time.
               # NOTE: no apostrophes in this script, it is single-quoted.
-              git clone --depth 1 https://github.com/raspberrypi/utils.git /work/rpi-utils
+              git clone https://github.com/raspberrypi/utils.git /work/rpi-utils
               cmake -B /work/rpi-utils/piolib/build /work/rpi-utils/piolib \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX=/usr \
@@ -82,7 +82,7 @@ jobs:
               cmake --install /work/rp1-jtag/build
 
               # Clone and patch openFPGALoader
-              git clone --depth 1 --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" /work/openFPGALoader
+              git clone --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" /work/openFPGALoader
               git -C /work/openFPGALoader log -1 --format="openFPGALoader %H %s"
               python3 /work/rp1-jtag/drivers/openfpgaloader/integrate.py /work/openFPGALoader
 
@@ -188,7 +188,7 @@ jobs:
               cmake --install /work/rp1-jtag/build
 
               # Clone and patch openFPGALoader
-              git clone --depth 1 --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" /work/openFPGALoader
+              git clone --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" /work/openFPGALoader
               git -C /work/openFPGALoader log -1 --format="openFPGALoader %H %s"
               python3 /work/rp1-jtag/drivers/openfpgaloader/integrate.py /work/openFPGALoader
 

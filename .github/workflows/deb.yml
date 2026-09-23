@@ -86,7 +86,7 @@ jobs:
               # Only the library target: the piolib examples link against
               # gpiolib from the sibling pinctrl/ tree, which is not built
               # when piolib is configured standalone.
-              git clone --depth 1 https://github.com/raspberrypi/utils.git /work/rpi-utils
+              git clone https://github.com/raspberrypi/utils.git /work/rpi-utils
               cmake -B /work/rpi-utils/piolib/build -S /work/rpi-utils/piolib \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX=/usr \
@@ -110,8 +110,10 @@ jobs:
                 exit 1
               fi
 
-              # 2. openFPGALoader with the rp1pio cable driver.
-              git clone --depth 1 --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" openFPGALoader
+              # 2. openFPGALoader with the rp1pio cable driver. Full history,
+              # not --depth 1: the version below counts its commits, and a
+              # shallow clone counts 1 no matter how far the branch has moved.
+              git clone --branch "$OPENFPGALOADER_REF" "$OPENFPGALOADER_REPO" openFPGALoader
               git -C openFPGALoader log -1 --format="openFPGALoader %H %s"
               # OPENFPGALOADER_REF is a branch, so it can move while this
               # repository does not. Put its commit in the version (issue #18):
@@ -258,7 +260,7 @@ jobs:
               # Only the library target: the piolib examples link against
               # gpiolib from the sibling pinctrl/ tree, which is not built
               # when piolib is configured standalone.
-              git clone --depth 1 https://github.com/raspberrypi/utils.git /work/rpi-utils
+              git clone https://github.com/raspberrypi/utils.git /work/rpi-utils
               cmake -B /work/rpi-utils/piolib/build -S /work/rpi-utils/piolib \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX=/usr \
@@ -272,8 +274,9 @@ jobs:
               dpkg -i /work/librp1jtag0_*.deb /work/librp1jtag-dev_*.deb
               ldconfig
 
-              # 2. OpenOCD with the rp1_pio_jtag adapter driver.
-              git clone --depth 1 https://github.com/openocd-org/openocd.git
+              # 2. OpenOCD with the rp1_pio_jtag adapter driver. Full history,
+              # not --depth 1, so the version below can count its commits.
+              git clone https://github.com/openocd-org/openocd.git
               git -C openocd log -1 --format="openocd %H %s"
               # master moves independently of this repository: version by its
               # commit too, as openfpgaloader-rp1pio does (issue #18).
