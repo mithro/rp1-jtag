@@ -2,7 +2,21 @@
 
 ## Project Overview
 
-rp1-jtag: High-speed JTAG via Raspberry Pi 5 RP1 PIO. C library (`librp1jtag`) wrapping PIOLib for autonomous JTAG shift operations, plus drivers for openFPGALoader and OpenOCD, plus a standalone XVC daemon.
+rp1-jtag: High-speed JTAG via Raspberry Pi 5 RP1 PIO. C library (`librp1jtag`) wrapping PIOLib for autonomous JTAG shift operations, plus drivers for openFPGALoader and OpenOCD.
+
+**This is the development repository, not a distribution one.** CI builds the
+library and both tools from unpatched upstream and uploads the binaries as
+workflow artifacts. It publishes no Debian packages and no releases, and its
+GitHub Pages apt repository is frozen and superseded.
+
+Packages and static binaries for fpgas.online are built and published by
+[fpgas-online/fpgas.online-fpga-tools](https://github.com/fpgas-online/fpgas.online-fpga-tools),
+which vendors these drivers as part of a larger patch series. Feature work
+that is not about RP1 PIO JTAG — SPI flash info, NeTV2 board definitions,
+Tiny Tapeout, ECP5 TraceID — belongs there or in the upstream projects, not
+here. `debian/` stays maintained here as the packaging source that repository
+builds `librp1jtag0` / `librp1jtag-dev` from; do not delete it without
+telling that repository first.
 
 ## Build
 
@@ -40,7 +54,7 @@ sudo ./build/tests/hardware/test_idcode            # Needs NeTV2
 - `lib/src/pio/` — PIO programs (.pio source + generated .pio.h)
 - `drivers/openfpgaloader/` — openFPGALoader cable driver (C++)
 - `drivers/openocd/` — OpenOCD adapter driver (C, GPL-2.0)
-- `xvc/` — Standalone XVC daemon
+- `debian/` — librp1jtag0 / librp1jtag-dev packaging, built downstream
 - `tests/pio_sim/` — Custom PIO simulator (C, no hardware)
 - `tests/unit/` — Unit tests with mock PIOLib backend
 - `tests/hardware/` — Hardware integration tests (RPi 5 required)
@@ -49,8 +63,9 @@ sudo ./build/tests/hardware/test_idcode            # Needs NeTV2
 
 - TMS controlled by host GPIO (not PIO pin) because TDI and TMS are non-contiguous
 - TMS vector split into constant-value runs, each becoming one PIO transfer
-- Phase 1: word-by-word FIFO interleaving (~400 kB/s, 80x over sysfsgpio)
-- Phase 2: DMA for bulk transfers
+- Phase 1: word-by-word FIFO interleaving — what `main` ships, `use_dma = false`,
+  measured ~97 kB/s (3.8 MB bitstream in ~39 s on rpi5-netv2, 2026-09-22)
+- Phase 2: DMA for bulk transfers — work in progress, not on `main`
 - 1 state machine used (of 4 available on RP1's single PIO block)
 
 ## NeTV2 JTAG Pins (default)
