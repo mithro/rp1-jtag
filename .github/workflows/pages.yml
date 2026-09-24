@@ -1,0 +1,49 @@
+name: Pages pointer
+
+# Replaces the GitHub Pages site with a single page saying where the packages
+# went. The site used to be the signed apt repository at mith.ro/rp1-jtag,
+# published by deb.yml, which this repository no longer builds.
+#
+# A Pages deployment replaces the WHOLE site, so publishing this page removes
+# the apt repository: no Packages, no Release, no .deb. That is the intent --
+# a host still pointed at mith.ro/rp1-jtag should fail on `apt update` rather
+# than quietly install from a frozen repository forever -- but it means this
+# workflow must not run until every host has been moved to
+# https://fpgas.online/fpgas.online-fpga-tools/.
+#
+# Hence workflow_dispatch and nothing else: merging this file changes nothing
+# by itself, and someone has to decide the moment.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Publish the pointer page
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/pages/
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rp1-jtag packages have moved</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1a1a1a; --bg: #ffffff; --muted: #5a5a5a; --line: #d8d8d8; --code-bg: #f4f4f4; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #e6e6e6; --bg: #161616; --muted: #a0a0a0; --line: #333; --code-bg: #222; }
+  }
+  body { margin: 0 auto; padding: 2rem 1rem 4rem; max-width: 46rem;
+         font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+         color: var(--fg); background: var(--bg); }
+  h1 { font-size: 1.6rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.1rem; margin-top: 2rem; border-bottom: 1px solid var(--line); padding-bottom: .3rem; }
+  p.lede { color: var(--muted); margin-top: 0; }
+  pre { background: var(--code-bg); padding: .8rem 1rem; overflow-x: auto; border-radius: 6px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid var(--line); }
+  footer { margin-top: 3rem; color: var(--muted); font-size: .9em; }
+</style>
+</head>
+<body>
+
+<h1>The rp1-jtag apt repository has moved</h1>
+<p class="lede">This address no longer serves Debian packages. Packages and
+static binaries are published by
+<a href="https://github.com/fpgas-online/fpgas.online-fpga-tools">fpgas.online-fpga-tools</a>.</p>
+
+<p><a href="https://github.com/mithro/rp1-jtag">mithro/rp1-jtag</a> is now the
+development repository for <code>librp1jtag</code> and its openFPGALoader and
+OpenOCD drivers. Its CI uploads binaries as workflow artifacts and publishes
+nothing installable.</p>
+
+<h2>New package names</h2>
+
+<table>
+<tr><th>Was, here</th><th>Now, at fpgas.online</th></tr>
+<tr><td><code>openfpgaloader-rp1pio</code></td><td><code>openfpgaloader-fpgasonline</code> or <code>-fpgasonline-git</code></td></tr>
+<tr><td><code>openocd-rp1pio</code></td><td><code>openocd-fpgasonline</code> or <code>-fpgasonline-git</code></td></tr>
+</table>
+
+<p>The <code>-git</code> packages are built from a pinned snapshot of upstream
+master, the others from the latest upstream release. Both carry the RP1 PIO
+JTAG driver, so the <code>rp1pio</code> cable and the
+<code>rp1_pio_jtag</code> adapter keep their names.</p>
+
+<h2>Switching a host over</h2>
+
+<pre><code>sudo rm -f /etc/apt/sources.list.d/rp1-jtag.list
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://fpgas.online/fpgas.online-fpga-tools/fpgas-online-fpga-tools.asc \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/fpgas-online-fpga-tools.gpg
+echo "deb [signed-by=/etc/apt/keyrings/fpgas-online-fpga-tools.gpg] \
+  https://fpgas.online/fpgas.online-fpga-tools/$(. /etc/os-release; echo $VERSION_CODENAME)/ ./" \
+  | sudo tee /etc/apt/sources.list.d/fpgas-online-fpga-tools.list
+sudo apt update
+sudo apt install openfpgaloader-fpgasonline-git openocd-fpgasonline-git
+</code></pre>
+
+<p>The new packages <code>Conflict</code> and <code>Replace</code> the old
+ones, so that <code>apt install</code> removes them in the same step. The
+<code>gpg --dearmor</code> matters: apt reads a keyring's format from its
+file extension, and armour saved under a <code>.gpg</code> name makes the
+repository read as unsigned on Debian 12.</p>
+
+<footer>
+<a href="https://github.com/mithro/rp1-jtag">mithro/rp1-jtag</a> &middot;
+<a href="https://github.com/fpgas-online/fpgas.online-fpga-tools">fpgas-online/fpgas.online-fpga-tools</a>
+</footer>
+
+</body>
+</html>
