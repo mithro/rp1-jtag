@@ -8,8 +8,11 @@ name: Notify fpgas.online-fpga-tools
 # than tomorrow.
 #
 # Requires the repository secret FPGA_TOOLS_DISPATCH_TOKEN: a fine-grained
-# token scoped to that one repository, with Contents: write (to dispatch) and
-# Actions: read (to confirm a run started).
+# token scoped to that one repository, with Actions: write -- enough to start
+# its daily.yml and to read back the run that proves the start took. The
+# repository_dispatch endpoint would instead have needed Contents: write,
+# which over there is the power to rewrite debian/ and publish packages the
+# fleet installs; that is far more than a notification should carry.
 #
 # This job FAILS when it cannot notify, deliberately. It used to warn and pass,
 # which meant a green check reported success while no credential existed and
@@ -26,7 +29,7 @@ permissions:
 
 jobs:
   dispatch:
-    name: repository_dispatch rp1jtag-updated
+    name: workflow_dispatch daily.yml
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
