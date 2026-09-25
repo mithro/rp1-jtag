@@ -49,22 +49,24 @@ JTAG driver, so the <code>rp1pio</code> cable and the
 
 <h2>Switching a host over</h2>
 
-<pre><code>sudo rm -f /etc/apt/sources.list.d/rp1-jtag.list
-sudo install -d -m 0755 /etc/apt/keyrings
-curl -fsSL https://fpgas.online/fpgas.online-fpga-tools/fpgas-online-fpga-tools.asc \
-  | sudo gpg --dearmor -o /etc/apt/keyrings/fpgas-online-fpga-tools.gpg
-echo "deb [signed-by=/etc/apt/keyrings/fpgas-online-fpga-tools.gpg] \
-  https://fpgas.online/fpgas.online-fpga-tools/$(. /etc/os-release; echo $VERSION_CODENAME)/ ./" \
-  | sudo tee /etc/apt/sources.list.d/fpgas-online-fpga-tools.list
+<p>Replace <code>trixie</code> with your system's release
+(<code>. /etc/os-release; echo $VERSION_CODENAME</code>): bookworm, trixie
+and sid are published.</p>
+
+<pre><code>sudo rm -f /etc/apt/sources.list.d/rp1-jtag.list /etc/apt/keyrings/rp1-jtag.gpg
+sudo install -d -m0755 /etc/apt/keyrings
+curl -fsSL https://fpgas.online/fpgas.online-fpga-tools/fpgas.online-fpga-tools.gpg \
+  | sudo tee /etc/apt/keyrings/fpgas.online-fpga-tools.gpg &gt; /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/fpgas.online-fpga-tools.gpg] https://fpgas.online/fpgas.online-fpga-tools/trixie/ ./" \
+  | sudo tee /etc/apt/sources.list.d/fpgas.online-fpga-tools.list
 sudo apt update
 sudo apt install openfpgaloader-fpgasonline-git openocd-fpgasonline-git
 </code></pre>
 
 <p>The new packages <code>Conflict</code> and <code>Replace</code> the old
-ones, so that <code>apt install</code> removes them in the same step. The
-<code>gpg --dearmor</code> matters: apt reads a keyring's format from its
-file extension, and armour saved under a <code>.gpg</code> name makes the
-repository read as unsigned on Debian 12.</p>
+ones, so that <code>apt install</code> removes them in the same step.
+<a href="https://fpgas.online/fpgas.online-fpga-tools/">fpgas.online/fpgas.online-fpga-tools</a>
+lists every package and the signing key's fingerprint.</p>
 
 <footer>
 <a href="https://github.com/mithro/rp1-jtag">mithro/rp1-jtag</a> &middot;
