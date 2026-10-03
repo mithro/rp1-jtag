@@ -14,6 +14,9 @@ compile_commands.json
 .DS_Store
 Thumbs.db
 
+# Claude Code
+.claude/
+
 # Temporary files
 tmp/
 *.swp

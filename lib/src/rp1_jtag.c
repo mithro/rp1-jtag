@@ -11,10 +11,9 @@
  * (OE) on TMS. TMS value is set via set_pins_with_mask.
  *
  * Three transfer paths:
- *   1. Interleaved streaming DMA (tdo==NULL, large): streaming mode
- *      (X=0xFFFFFFFF, jmp to loop body), autopush ON, interleaved
- *      32-byte TX→RX DMA chunks. No count word, no SM restart.
- *      Partial tail bits via FIFO write (count-word protocol).
+ *   1. TX-only streaming DMA (tdo==NULL, large): streaming mode
+ *      (X=0xFFFFFFFF, jmp offset+2) with autopush OFF, TX-only DMA.
+ *      Data padded to 32-bit words. SM drain via clock_nanosleep.
  *   2. FIFO write (tdo==NULL, small): count-word protocol, autopush OFF,
  *      direct FIFO writes via pio_sm_put_blocking. No DMA.
  *   3. Sequential DMA (tdo!=NULL): 224-bit chunks with SM restart per
@@ -31,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef HAVE_PIOLIB
@@ -38,6 +38,7 @@
 #include "pio/generated/jtag_shift.pio.h"
 /* jtag_tms.pio.h no longer needed — SM1 uses set_pins_with_mask */
 #include "pio/generated/jtag_loopback.pio.h"
+#include "pio/generated/jtag_stream.pio.h"
 #endif
 
 /* ---- Bit vector utilities ---- */
@@ -128,29 +129,34 @@ void words_to_bits(const uint32_t *words, uint32_t num_words,
 /* DMACTRL register overrides for TX and RX DMA.
  *
  * Register layout: bit 31 = DREQ_EN, bit 30 = HIGH_PRIORITY,
- * bits 11:7 = TREQ_SEL (priority), bits 4:0 = DREQ threshold.
+ * bits 4:0 = DREQ threshold.
  *
- * Threshold=4 is used for both TX and RX. Empirical testing with
- * rpi5-rp1-pio-bench shows that threshold=8 causes 25% data corruption
- * for DMA transfers < 128 KB, while threshold<=4 works correctly at
- * all sizes (128 bytes to 256 KB, 0% error rate).
+ * Threshold=8 matches the 8-beat burst size of heavy DMA channels 0/1
+ * (PR #7190 fix). This is the value used by rpi5-rp1-pio-bench which
+ * achieves 42 MB/s with concurrent DMA.
  *
- * For RX with fewer than 4 words (shifts < 96 bits), the threshold is
- * dynamically lowered to 1 per-chunk — otherwise DREQ never fires and
- * the DMA times out. This is safe for small transfers because the AXI
- * bus contention that breaks threshold=1 at large sizes is negligible
- * for transfers of only a few words.
- *
- * config_xfer is called at the start of each bulk shift to reset the
- * kernel's DMA state (semaphore, head/tail indices, pending transfers).
- * Without this reset, accumulated state from previous shifts can cause
- * spurious timeouts.
+ * For the sequential DMA path (small transfers with < 4 RX words),
+ * threshold=1 is used because DREQ never fires with threshold > FIFO
+ * contents.
  *
  * Must be applied AFTER pio_sm_config_xfer() which resets DMACTRL. */
+#define DMACTRL_DEFAULT 0xC0000108  /* enable + high_pri + threshold=8 */
 #define DMACTRL_TX      0xC0000104  /* enable + high_pri + threshold=4 */
-#define DMACTRL_RX_4    0xC0000104  /* enable + high_pri + threshold=4 */
 #define DMACTRL_RX_1    0xC0000101  /* enable + high_pri + threshold=1 */
-#define DMACTRL_RX_THRESHOLD_MIN_WORDS 4  /* use threshold=4 when >= 4 RX words */
+#define DMACTRL_RX_THRESHOLD_MIN_WORDS 4  /* use threshold=1 when < 4 RX words */
+
+/* DMA chunk size for TX-only streaming path.
+ * Each xfer_data call transfers up to this many bytes.
+ *
+ * The streaming path uses PIO_FIFO_JOIN_TX (16-deep TX FIFO) and
+ * the jtag_stream program (2 instr/bit).  RP1 DMA writes each chunk
+ * at PCIe speed without DREQ pacing, so the chunk must fit entirely
+ * in the joined FIFO.  15 words (60 bytes) leaves 1 word margin.
+ *
+ * With 8-deep FIFO (no join): max 7 words = 28 bytes
+ * With 16-deep FIFO (joined): max 15 words = 60 bytes
+ */
+#define STREAM_DMA_BUF  4096
 
 /* DMA transfer thread args */
 typedef struct {
@@ -163,7 +169,7 @@ typedef struct {
     int err;            /* errno captured on failure */
 } xfer_args_t;
 
-/* DMA transfer thread: single xfer_data call for the full transfer. */
+/* DMA transfer: single xfer_data call (used directly for sequential path). */
 static void *xfer_thread(void *arg)
 {
     xfer_args_t *a = (xfer_args_t *)arg;
@@ -172,7 +178,6 @@ static void *xfer_thread(void *arg)
     a->err = errno;
     return NULL;
 }
-
 
 /* ---- Loopback shift via DMA (single SM, no TMS) ---- */
 
@@ -219,10 +224,10 @@ static int loopback_shift_dma(rp1_jtag_t *jtag, uint32_t num_bits,
     /* Override DMACTRL for both TX and RX.
      * Must come AFTER config_xfer which resets DMACTRL to defaults.
      * RX threshold depends on word count (threshold=4 needs >= 4 words). */
-    pio_sm_set_dmactrl(pio, sm0, true,  DMACTRL_TX);
+    pio_sm_set_dmactrl(pio, sm0, true,  DMACTRL_DEFAULT);
     pio_sm_set_dmactrl(pio, sm0, false,
                        num_data_words >= DMACTRL_RX_THRESHOLD_MIN_WORDS
-                       ? DMACTRL_RX_4 : DMACTRL_RX_1);
+                       ? DMACTRL_DEFAULT : DMACTRL_RX_1);
 
     /* Enable state machine */
     pio_sm_set_enabled(pio, sm0, true);
@@ -398,43 +403,32 @@ static int jtag_shift_fifo(rp1_jtag_t *jtag, uint32_t num_bits,
     return 0;
 }
 
-/* Bytes per interleaved DMA chunk in streaming mode.
- * 32 bytes = 8 words = 256 bits. This is the maximum because the RP1
- * PIO RX FIFO is 8 words deep: after 8 autopush words, the FIFO is
- * full and the SM stalls until it is drained by RX DMA.
- *
- * Concurrent TX+RX DMA (pthreads) corrupts data on RP1 PIOLib due to
- * a kernel driver race condition — verified empirically: DONE=0 with
- * concurrent, DONE=1 with interleaved. So we must interleave. */
-#define STREAM_CHUNK_BYTES  32
-
-/* Words per streaming DMA chunk */
-#define STREAM_CHUNK_WORDS  (STREAM_CHUNK_BYTES / sizeof(uint32_t))  /* 8 */
-
-/* Minimum bits to use the streaming DMA path.
+/* Minimum bits to use the TX-only streaming DMA path.
  * Below this, jtag_shift_fifo handles the transfer with no DMA. */
 #define STREAM_THRESHOLD    1024
 
 /*
- * Interleaved streaming DMA path for write-only transfers (tdo==NULL).
+ * TX-only streaming DMA path for write-only transfers (tdo==NULL).
  *
- * Uses streaming mode: exec "mov x, !null" + "jmp offset+2" to skip
- * the count-word preamble. X = 0xFFFFFFFF gives 4 billion iterations —
- * DMA completes long before that. SM stalls on autopull when TX FIFO
- * empties (TCK stays LOW — safe).
+ * Uses streaming mode (X=0xFFFFFFFF, jmp offset+2) to skip the
+ * count-word protocol. The SM loops for ~4 billion bits, stalling
+ * on autopull when the TX FIFO empties (TCK stays LOW — safe).
  *
- * With autopush ON, every 32 IN instructions produce 1 RX word.
- * Interleaved 32-byte DMA chunks: TX(32) → RX(32) → repeat.
- * No SM restart between chunks — the SM runs continuously.
- * RX data is discarded (tdo==NULL) but must be drained to prevent
- * the 8-deep RX FIFO from stalling the SM.
+ * Autopush OFF: the `in` instruction samples TDO into the ISR but
+ * the ISR wraps silently — no RX FIFO push, no SM stall. This
+ * allows TX-only DMA at full speed (46.5 MB/s in benchmarks).
  *
- * Only full 32-bit words in multiples of STREAM_CHUNK_WORDS go through
- * DMA. Remaining bits are handled by jtag_shift_fifo using the
- * count-word protocol for exact bit count.
+ * Only complete 32-bit words are sent via DMA to avoid inserting
+ * extra padding bits between openFPGALoader's bitstream segments.
+ * Any remaining partial word (num_bits % 32 != 0) is sent via
+ * jtag_shift_fifo() which uses the count-word protocol for exact
+ * bit counts.
  *
- * Performance: ~240K ioctls per 3.8 MB bitstream at ~25μs per TX+RX
- * pair = ~6s. Ioctl-limited, not TCK-limited.
+ * Completion: after DMA returns (all TX data consumed by SM via
+ * DREQ pacing), at most 8 FIFO words + 1 OSR word remain to be
+ * processed. We compute the SM drain time from the clock divider
+ * and sleep with clock_nanosleep for the exact duration, plus a
+ * safety margin. Then disable the SM.
  */
 static int jtag_shift_streaming(rp1_jtag_t *jtag, uint32_t num_bits,
                                   bool tms_value, const uint8_t *tdi,
@@ -445,58 +439,128 @@ static int jtag_shift_streaming(rp1_jtag_t *jtag, uint32_t num_bits,
     uint sm1 = (uint)jtag->sm1;
     int ret = 0;
 
-    /* Round down to the largest multiple of STREAM_CHUNK_WORDS.
-     * This ensures every DMA chunk is exactly STREAM_CHUNK_BYTES,
-     * avoiding issues with MIN_DMA_BYTES on the last chunk.
-     * Any leftover bits go through jtag_shift_fifo. */
-    uint32_t stream_words = (num_bits / 32 / STREAM_CHUNK_WORDS)
-                          * STREAM_CHUNK_WORDS;
-    uint32_t fifo_bits = num_bits - stream_words * 32;
+    /* Split into full 32-bit words (DMA) and tail bits (FIFO).
+     * DMA can only send complete words; partial words would pad
+     * with zeros, corrupting the bitstream between segments. */
+    uint32_t stream_bits = num_bits & ~31u;  /* round down to 32 */
+    uint32_t tail_bits = num_bits - stream_bits;
+    uint32_t num_words = stream_bits / 32;
 
-    if (stream_words == 0) {
+    /* If no full words, fall through to FIFO path entirely */
+    if (num_words == 0)
         return jtag_shift_fifo(jtag, num_bits, tms_value, tdi, start_bit);
-    }
 
     /* Set TMS */
     uint32_t tms_mask = 1u << jtag->pins.tms;
     pio_sm_set_pins_with_mask(pio, sm1,
                                tms_value ? tms_mask : 0, tms_mask);
 
-    size_t dma_bytes = (size_t)stream_words * sizeof(uint32_t);
+    /* Build TX buffer: full data words only (no count word, no padding) */
+    size_t tx_bytes = (size_t)num_words * sizeof(uint32_t);
+    if (tx_bytes < MIN_DMA_BYTES) tx_bytes = MIN_DMA_BYTES;
 
-    /* Allocate aligned TX and RX buffers */
-    size_t alloc = (dma_bytes + 63) & ~(size_t)63;
+    size_t alloc = (tx_bytes + 63) & ~(size_t)63;
     uint32_t *tx_buf = (uint32_t *)aligned_alloc(64, alloc);
-    uint32_t *rx_buf = (uint32_t *)aligned_alloc(64, alloc);
-    if (!tx_buf || !rx_buf) {
-        free(tx_buf);
-        free(rx_buf);
+    if (!tx_buf)
         return RP1_JTAG_ERR_IO;
-    }
-    memset(tx_buf, 0, dma_bytes);
+    memset(tx_buf, 0, alloc);
 
-    /* Pack TDI data (stream_words only, no count word) */
+    /* Pack TDI data — only full words (stream_bits) */
     if (start_bit % 8 == 0) {
-        memcpy(tx_buf, tdi + start_bit / 8, stream_words * 4);
+        const uint8_t *src = tdi + start_bit / 8;
+        memcpy(tx_buf, src, num_words * 4);
     } else {
-        bits_to_words(tdi, start_bit, stream_words * 32, tx_buf);
+        bits_to_words(tdi, start_bit, stream_bits, tx_buf);
     }
 
-    /* Configure DMA for STREAM_CHUNK_BYTES per call */
-    if (pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM,
-                            STREAM_CHUNK_BYTES, 1) < 0 ||
-        pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM,
-                            STREAM_CHUNK_BYTES, 1) < 0) {
+    /* SM init with jtag_stream program (2 instr/bit, autopush OFF).
+     * Uses STREAM_INSTR_PER_BIT for clock divider calculation. */
+    pio_sm_set_enabled(pio, sm0, false);
+    pio_sm_clear_fifos(pio, sm0);
+    pio_sm_restart(pio, sm0);
+    float stream_div;
+    pio_select(pio);
+    {
+        pio_sm_config c = jtag_stream_program_get_default_config(
+                              jtag->offset_stream);
+        sm_config_set_out_pins(&c, jtag->pins.tdi, 1);
+        sm_config_set_in_pins(&c, jtag->pins.tdo);
+        sm_config_set_sideset_pins(&c, jtag->pins.tck);
+        sm_config_set_out_shift(&c, true, true, 32);    /* autopull ON */
+        sm_config_set_in_shift(&c, true, false, 32);    /* autopush OFF */
+        sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);  /* 16-deep TX FIFO */
+        stream_div = (float)RP1_PIO_CLK_HZ /
+                     ((float)jtag->freq_hz * STREAM_INSTR_PER_BIT);
+        if (stream_div < 1.0f) stream_div = 1.0f;
+        sm_config_set_clkdiv(&c, stream_div);
+        pio_sm_init(pio, sm0, jtag->offset_stream, &c);
+    }
+
+    /* Max chunk size is limited by TX FIFO depth (8 words = 32 bytes).
+     * Each xfer_data call writes the entire chunk at PCIe speed without
+     * DREQ pacing, so it must fit in the FIFO.  Use 7 words (28 bytes)
+     * to leave 1 word margin for timing variation. */
+    uint32_t stream_chunk = STREAM_DMA_BUF;
+
+    /* Configure TX-only DMA with computed chunk size.
+     * config_xfer resets DMACTRL, so set DMACTRL after. */
+    if (pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, stream_chunk, 1) < 0) {
         fprintf(stderr, "rp1_jtag: streaming config_xfer failed\n");
         ret = RP1_JTAG_ERR_IO;
         goto cleanup;
     }
-    pio_sm_set_dmactrl(pio, sm0, true,  DMACTRL_TX);
-    pio_sm_set_dmactrl(pio, sm0, false, DMACTRL_RX_4);
+    pio_sm_set_dmactrl(pio, sm0, true, DMACTRL_DEFAULT);
 
-    /* Full SM init with autopush ON (streaming mode needs 1:1 TX:RX). */
+    /* jtag_stream uses .wrap — no count word, no jmp needed.
+     * SM starts at offset_stream and loops via hardware wrap.
+     * SM stalls on autopull at out pins,1 when TX FIFO empties. */
+    pio_sm_set_enabled(pio, sm0, true);
+
+    /* Record SM enable time for drain calculation */
+    struct timespec t_enable;
+    clock_gettime(CLOCK_MONOTONIC, &t_enable);
+
+    /* TX DMA: loop over chunks sized to SM drain rate. */
+    {
+        uint8_t *ptr = (uint8_t *)tx_buf;
+        size_t remaining = tx_bytes;
+
+        while (remaining > 0) {
+            size_t chunk = remaining > stream_chunk ? stream_chunk : remaining;
+            errno = 0;
+            int rc = pio_sm_xfer_data(pio, sm0, PIO_DIR_TO_SM, chunk, ptr);
+            if (rc < 0) {
+                fprintf(stderr, "rp1_jtag: streaming TX DMA failed (%d/%s)\n",
+                        rc, strerror(errno));
+                ret = RP1_JTAG_ERR_IO;
+                break;
+            }
+            ptr += chunk;
+            remaining -= chunk;
+        }
+    }
+
+    /* Wait for SM to drain remaining FIFO + OSR data.
+     * With DREQ-paced DMA, xfer_data blocks until data is written
+     * to the FIFO.  After the last call returns, at most 16 joined
+     * FIFO words + 1 OSR word (= 544 bits) are still in flight.
+     * Sleep for their drain time with generous margin. */
+    if (ret == 0) {
+        double drain_bits = (16 + 1) * 32.0;  /* joined FIFO + OSR */
+        double drain_ns = drain_bits * STREAM_INSTR_PER_BIT
+                          * stream_div / RP1_PIO_CLK_HZ * 1e9;
+        drain_ns = drain_ns * 2.0 + 1000000.0;  /* 2× margin + 1ms */
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = (long)drain_ns;
+        clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
+    }
+
+cleanup:
     pio_sm_set_enabled(pio, sm0, false);
     pio_sm_clear_fifos(pio, sm0);
+
+    /* Restore SM config with autopush ON for sequential DMA path */
     pio_select(pio);
     {
         pio_sm_config c = jtag_shift_program_get_default_config(jtag->offset0);
@@ -512,64 +576,21 @@ static int jtag_shift_streaming(rp1_jtag_t *jtag, uint32_t num_bits,
         pio_sm_init(pio, sm0, jtag->offset0, &c);
     }
 
-    /* Streaming mode: set X = 0xFFFFFFFF, jump to loop body (offset+2).
-     * Skips the pull+out x,32 preamble — no count word needed. */
-    pio_sm_exec(pio, sm0, pio_encode_mov_not(pio_x, pio_null));
-    pio_sm_exec(pio, sm0, pio_encode_jmp(jtag->offset0 + 2));
-    pio_sm_set_enabled(pio, sm0, true);
-
-    /* Interleaved DMA: TX chunk → RX chunk, no SM restart.
-     * The SM runs continuously — it stalls on autopull when the TX
-     * FIFO empties (TCK LOW), then resumes when the next TX chunk
-     * feeds more data. */
-    {
-        uint8_t *tx_ptr = (uint8_t *)tx_buf;
-        uint8_t *rx_ptr = (uint8_t *)rx_buf;
-        size_t remaining = dma_bytes;
-
-        while (remaining > 0) {
-            /* TX: feed 32 bytes (8 words) to SM */
-            if (pio_sm_xfer_data(pio, sm0, PIO_DIR_TO_SM,
-                                  STREAM_CHUNK_BYTES, tx_ptr) < 0) {
-                ret = RP1_JTAG_ERR_IO;
-                break;
-            }
-
-            /* RX: drain 32 bytes (8 autopush words) from SM */
-            if (pio_sm_xfer_data(pio, sm0, PIO_DIR_FROM_SM,
-                                  STREAM_CHUNK_BYTES, rx_ptr) < 0) {
-                ret = RP1_JTAG_ERR_IO;
-                break;
-            }
-
-            tx_ptr += STREAM_CHUNK_BYTES;
-            rx_ptr += STREAM_CHUNK_BYTES;
-            remaining -= STREAM_CHUNK_BYTES;
-        }
-    }
-
-cleanup:
-    pio_sm_set_enabled(pio, sm0, false);
-    pio_sm_clear_fifos(pio, sm0);
-
     /* Restore DMA config for sequential/FIFO paths */
     pio_sm_config_xfer(pio, sm0, PIO_DIR_TO_SM, DMA_BUF_SIZE, 1);
     pio_sm_config_xfer(pio, sm0, PIO_DIR_FROM_SM, DMA_BUF_SIZE, 1);
-    pio_sm_set_dmactrl(pio, sm0, true, DMACTRL_TX);
+    pio_sm_set_dmactrl(pio, sm0, true, DMACTRL_DEFAULT);
 
     free(tx_buf);
-    free(rx_buf);
 
-    if (ret != 0)
-        return ret;
-
-    /* Handle remaining bits via FIFO write (exact bit count) */
-    if (fifo_bits > 0) {
-        return jtag_shift_fifo(jtag, fifo_bits, tms_value, tdi,
-                                start_bit + stream_words * 32);
+    /* Handle remaining partial word via FIFO path (exact bit count).
+     * This avoids padding bits that would corrupt the bitstream. */
+    if (ret == 0 && tail_bits > 0) {
+        ret = jtag_shift_fifo(jtag, tail_bits, tms_value, tdi,
+                              start_bit + stream_bits);
     }
 
-    return 0;
+    return ret;
 }
 
 /*
@@ -597,7 +618,7 @@ static int jtag_shift_sequential(rp1_jtag_t *jtag, uint32_t num_bits,
         fprintf(stderr, "rp1_jtag: config_xfer reset failed\n");
         return RP1_JTAG_ERR_IO;
     }
-    pio_sm_set_dmactrl(pio, sm0, true, DMACTRL_TX);
+    pio_sm_set_dmactrl(pio, sm0, true, DMACTRL_DEFAULT);
 
     /* Set TMS */
     uint32_t tms_mask = 1u << jtag->pins.tms;
@@ -659,7 +680,7 @@ static int jtag_shift_sequential(rp1_jtag_t *jtag, uint32_t num_bits,
         memset(rx_buf, 0, chunk_rx_bytes);
 
         uint32_t rx_dmactrl = (chunk_rx_words >= DMACTRL_RX_THRESHOLD_MIN_WORDS)
-                              ? DMACTRL_RX_4 : DMACTRL_RX_1;
+                              ? DMACTRL_DEFAULT : DMACTRL_RX_1;
         pio_sm_set_dmactrl(pio, sm0, false, rx_dmactrl);
 
         /* SM restart per chunk */
@@ -740,9 +761,9 @@ static int jtag_shift_sequential(rp1_jtag_t *jtag, uint32_t num_bits,
  * TMS is driven as a constant GPIO output via SM1's set_pins_with_mask.
  *
  * Dispatches to:
- *   - Interleaved streaming DMA (tdo==NULL, >= STREAM_THRESHOLD bits):
- *     streaming mode with interleaved 32-byte TX→RX DMA chunks.
- *     No SM restart between chunks. Partial tail via jtag_shift_fifo.
+ *   - TX-only streaming DMA (tdo==NULL, >= STREAM_THRESHOLD bits):
+ *     streaming mode (X=0xFFFFFFFF) with autopush OFF, TX-only DMA.
+ *     Data padded to 32-bit words. SM drain via clock_nanosleep.
  *   - FIFO write (tdo==NULL, < STREAM_THRESHOLD bits):
  *     count-word protocol, no DMA, exact bit count via pio_sm_put_blocking.
  *   - Sequential DMA (tdo!=NULL): 224-bit chunks with SM restart per
@@ -826,6 +847,17 @@ rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
         return NULL;
     }
 
+    /* Load jtag_stream program (2 instructions, used by streaming path) */
+    uint offset_stream = pio_add_program(pio, &jtag_stream_program);
+    if (offset_stream == PIO_ORIGIN_INVALID) {
+        fprintf(stderr, "rp1_jtag: failed to load jtag_stream program\n");
+        pio_remove_program(pio, &jtag_shift_program, offset0);
+        pio_sm_unclaim(pio, (uint)sm1);
+        pio_sm_unclaim(pio, (uint)sm0);
+        pio_close(pio);
+        return NULL;
+    }
+
     /* Select PIO instance for sm_config_set_* functions */
     pio_select(pio);
 
@@ -901,6 +933,7 @@ rp1_jtag_t *rp1_jtag_init(const rp1_jtag_pins_t *pins)
     jtag->sm0 = sm0;
     jtag->sm1 = sm1;
     jtag->offset0 = offset0;
+    jtag->offset_stream = offset_stream;
     jtag->offset1 = 0;  /* no TMS program loaded */
 
     return jtag;
@@ -984,6 +1017,7 @@ void rp1_jtag_close(rp1_jtag_t *jtag)
     /* Remove programs from instruction memory */
     if (jtag->mode == MODE_JTAG) {
         pio_remove_program(pio, &jtag_shift_program, jtag->offset0);
+        pio_remove_program(pio, &jtag_stream_program, jtag->offset_stream);
     } else {
         pio_remove_program(pio, &jtag_loopback_program, jtag->offset0);
     }
